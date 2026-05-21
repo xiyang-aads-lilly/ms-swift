@@ -22,8 +22,13 @@ jobs:
           git remote add upstream https://github.com/modelscope/ms-swift.git
           git fetch upstream
           git checkout main
-          git merge upstream/main --ff-only || {
-            echo "Fast-forward not possible — upstream diverged. Attempting rebase..."
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            # Local is behind or equal — fast-forward is safe
+            git merge upstream/main --ff-only
+            git push origin main
+          else
+            # Local has diverged — rebase then force-push
+            echo "Diverged from upstream, rebasing..."
             git rebase upstream/main
-          }
-          git push origin main
+            git push origin main --force-with-lease
+          fi
