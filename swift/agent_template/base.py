@@ -75,20 +75,25 @@ class ReactCompatMixin:
 
     def _format_tool_responses(
         self,
-        assistant_content: str,
+        assistant_content: Union[str, List[str]],
         tool_messages,
-    ) -> Tuple[str, 'Prompt']:
+    ) -> Tuple[Union[str, List[str]], 'Prompt']:
         """
         Format tool execution results into the conversation.
 
         Args:
-            assistant_content: The assistant's message containing tool calls.
+            assistant_content: The assistant's message containing tool calls. A list when consecutive
+                assistant messages (e.g. text followed by tool calls) were merged into segments.
             tool_messages: List of tool execution result messages.
 
         Returns:
             Tuple of (formatted assistant content, formatted tool responses).
         """
         assert len(tool_messages) > 0
+        if isinstance(assistant_content, list):
+            # Keep merged assistant segments aligned with their loss/loss_scale entries.
+            last_content, res = self._format_tool_responses(assistant_content[-1], tool_messages)
+            return assistant_content[:-1] + [last_content], res
         with_action = self.keyword.action in assistant_content and self.keyword.action_input in assistant_content
         if with_action:
             if not assistant_content.endswith(self.keyword.observation):
@@ -108,6 +113,19 @@ class ReactCompatMixin:
             for tool_message in tool_messages:
                 res.append(tool_message['content'])
         return assistant_content, res
+
+    def _format_react_standalone_tool_responses(self, tool_messages) -> 'Prompt':
+        assert len(tool_messages) > 0
+        res = []
+        for tool_message in tool_messages:
+            tool_content = tool_message['content']
+            res.extend(['\n', self.keyword.observation, '\n', tool_content])
+        return res
+
+    def _format_standalone_tool_responses(self, tool_messages) -> 'Prompt':
+        """Format observations that do not follow an assistant tool call."""
+        raise NotImplementedError(
+            f'Agent template {self.__class__.__name__} does not support standalone tool responses.')
 
     @staticmethod
     def _parse_tool_call(content) -> Dict[str, Any]:
@@ -153,6 +171,21 @@ class BaseAgentTemplate(ReactCompatMixin, ABC):
     - `get_toolcall`: Extract tool calls from agent responses
     """
 
+    def _add_tool_call_prefix(self, tool_content: str, pre_message=None) -> str:
+        """Hook to prepend a separator before tool_call content based on the preceding message.
+
+        Subclasses can override this to match their jinja template's separator logic
+        (e.g., Qwen3.5/3.6 inserts '\n\n' when assistant has effective content before tool_calls).
+
+        Args:
+            tool_content: The formatted tool_call string from _format_tool_calls.
+            pre_message: The message immediately before the tool_call block, or None.
+
+        Returns:
+            tool_content with any necessary prefix prepended.
+        """
+        return tool_content
+
     @staticmethod
     def _get_tool_name(tool):
         return tool.get('name_for_model') or tool.get('name')
@@ -170,6 +203,20 @@ class BaseAgentTemplate(ReactCompatMixin, ABC):
         if 'type' not in tool and 'function' not in tool:
             tool = {'type': 'function', 'function': tool}
         return tool
+
+    def _get_tool_schemas(self, tools: Optional[List[Union[str, dict]]]) -> Dict[str, dict]:
+        tool_schemas = {}
+        for tool in tools or []:
+            tool = self._parse_json(tool)
+            if not isinstance(tool, dict):
+                continue
+            function = self.unwrap_tool(tool)
+            if not isinstance(function, dict):
+                continue
+            parameters = self._parse_json(function.get('parameters'))
+            if isinstance(parameters, dict):
+                tool_schemas[self._get_tool_name(function)] = parameters
+        return tool_schemas
 
     @staticmethod
     def _parse_tool(tool, lang: Literal['zh', 'en']) -> ToolDesc:

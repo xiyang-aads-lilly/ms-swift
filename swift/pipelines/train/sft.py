@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 
 from swift.arguments import SftArguments
 from swift.dataset import (AddLengthPreprocessor, DatasetLoader, EncodePreprocessor, IterablePackingDataset,
-                           LazyLLMDataset, PackingDataset, load_dataset)
+                           LazyLLMDataset, PackingDataset)
 from swift.infer_engine import prepare_generation_config
 from swift.ray_utils import RayHelper
 from swift.sequence_parallel import sequence_parallel
@@ -26,17 +26,20 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def __init__(self, args: Optional[Union[List[str], SftArguments]] = None) -> None:
         super().__init__(args)
         self.train_msg = {}
+        self._prepare_flash_ckpt()
         self._prepare_model_tokenizer()
         self._prepare_template()
-        self._prepare_flash_ckpt()
 
     @RayHelper.function(group='default')
     def _prepare_flash_ckpt(self):
         if self.args.use_flash_ckpt:
             try:
-                import dlrover.trainer.torch.flash_checkpoint.hf_trainer
+                from dlrover.trainer.torch.flash_checkpoint.engine import CheckpointEngine
+                from dlrover.trainer.torch.flash_checkpoint.hf_trainer import HfFlashCheckpointer
             except ImportError:
-                raise ValueError('Please install dlrover to use flash ckpt `pip install dlrover[k8s,torch]')
+                raise ValueError('Please install DLRover to use Flash Checkpoint: `pip install dlrover[k8s,torch]`.')
+            from swift.trainers.utils import check_dlrover_flash_checkpoint_api
+            check_dlrover_flash_checkpoint_api(HfFlashCheckpointer, CheckpointEngine)
 
     def _prepare_generation_config(self):
         args = self.args
@@ -78,20 +81,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def _get_dataset(self):
         # The random shuffling of the training set occurs in the dataloader of the trainer.
         args = self.args
-        dataset_kwargs = args.get_dataset_kwargs()
-        train_dataset, val_dataset = None, None
-        if args.dataset:
-            train_dataset, val_dataset = load_dataset(
-                args.dataset,
-                split_dataset_ratio=args.split_dataset_ratio,
-                shuffle=args.dataset_shuffle,
-                **dataset_kwargs)
-        if len(args.val_dataset) > 0:
-            # Loading val dataset
-            dataset_kwargs.pop('interleave_prob', None)
-            _, val_dataset = load_dataset(
-                args.val_dataset, split_dataset_ratio=1.0, shuffle=args.val_dataset_shuffle, **dataset_kwargs)
-            assert args.split_dataset_ratio == 0.
+        train_dataset, val_dataset = args.load_dataset()
         if args.truncation_strategy == 'split':
             logger.info(f'train_dataset: {train_dataset}')
             logger.info(f'val_dataset: {val_dataset}')
@@ -156,8 +146,10 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                     num_proc=args.dataset_num_proc,
                     packing_length=args.packing_length,
                     packing_num_proc=args.packing_num_proc,
+                    packing_strategy=args.packing_strategy,
                     strict=args.strict,
-                    load_from_cache_file=args.load_from_cache_file)
+                    load_from_cache_file=args.load_from_cache_file,
+                    multiprocessing_context=getattr(args, 'dataloader_multiprocessing_context', None))
             elif args.streaming:
                 preprocessor = EncodePreprocessor(template=template)
                 dataset = preprocessor(

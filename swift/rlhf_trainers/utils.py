@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import datasets
 import functools
+import inspect
 import ipaddress
 import math
 import os
@@ -16,20 +17,22 @@ from functools import partial
 from io import BytesIO
 from msgspec import field
 from packaging import version
-from peft.tuners import lora
 from peft.tuners.lora import LoraLayer
 from PIL import Image
 from pydantic import BaseModel, field_validator
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, RandomSampler
+from transformers.utils import is_torch_npu_available
 from types import MethodType
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
 
-from swift.template import Messages
+from swift.rl_core.data import GRPOBatch, OnPolicySample
+from swift.template import Messages, StdTemplateInputs, Template
 from swift.tuners.lora import LoraConfig
 from swift.utils import (gc_collect, get_cu_seqlens_from_position_ids, get_logger, get_packed_seq_params,
-                         get_torch_device, is_swanlab_available, is_vllm_available, is_wandb_available, synchronize,
-                         to_device)
+                         get_torch_device, is_swanlab_available, is_vllm_available, is_wandb_available, swanlab_get_run,
+                         synchronize, to_device)
 
 if is_wandb_available():
     import wandb
@@ -44,6 +47,16 @@ _ipv6_patch_applied = False
 VLLM_LORA_INT_ID = 111
 VLLM_LORA_NAME = 'swift_lora'
 VLLM_LORA_PATH = 'swift_dummy_lora_path'
+
+
+def broadcast_tensor_for_vllm_weight_sync(communicator, tensor: torch.Tensor, src: int) -> None:
+    if is_torch_npu_available():
+        device_module = get_torch_device()
+        with device_module.device(communicator.device):
+            communicator.broadcast(tensor, src=src, stream=device_module.current_stream())
+    else:
+        communicator.broadcast(tensor, src=src, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+
 
 if is_vllm_available():
     from vllm.lora.request import LoRARequest
@@ -231,45 +244,6 @@ def patch_stateless_process_group_for_ipv6():
 
 # Apply IPv6 patch at module load time
 patch_stateless_process_group_for_ipv6()
-
-
-def nanstd(tensor: torch.Tensor,
-           dim: Optional[Union[int, tuple[int, ...]]] = None,
-           keepdim: bool = False) -> torch.Tensor:
-    """
-    Compute the standard deviation of a tensor, ignoring NaNs.
-
-    Refer: trl/trainer/utils.py
-
-    Args:
-        tensor (`torch.Tensor`):
-            Input tensor.
-        dim (`int` or `tuple[int, ...]`, *optional*):
-            Dimension to reduce. Defaults to all dimensions.
-        keepdim (`bool`, *optional*, defaults to `False`):
-            Whether to keep reduced dimensions.
-
-    Returns:
-        `torch.Tensor`:
-            Standard deviation of the tensor, ignoring NaNs.
-    """
-    mean = torch.nanmean(tensor, dim=dim, keepdim=True)
-    variance = torch.nanmean((tensor - mean)**2, dim=dim, keepdim=True)
-    count = torch.sum(~torch.isnan(tensor), dim=dim, keepdim=True)
-    correction = count / (count - 1)
-    correction = torch.where(count > 1, correction, torch.full_like(correction, float('nan')))
-    variance *= correction  # Bessel's correction
-    std = torch.sqrt(variance)
-    if keepdim:
-        return std
-    if dim is None:
-        return std.squeeze()
-    if isinstance(dim, int):
-        return std.squeeze(dim)
-    dims = [(d if d >= 0 else d + std.ndim) for d in dim]
-    for d in sorted(dims, reverse=True):
-        std = std.squeeze(d)
-    return std
 
 
 # code borrowed from verl/verl/utils/memory_utils.py
@@ -508,7 +482,19 @@ def round_robin(num_reqs, num_workers):
 
 @contextmanager
 def patch_lora_merge(model, parameter_group=None):
-    """Patch LoraLayer's merge and get_delta_weight methods for controlled merging.
+    """Patch LoraLayer.merge to support selective merging by ``parameter_group``.
+
+    peft's ``merge_adapter()`` merges the whole model; this patch lets us merge only the
+    layers whose name is in ``parameter_group`` (used by the vLLM weight-sync, which merges
+    one parameter group at a time within its DeepSpeed Zero3 gather context).
+
+    Before merging, each target adapter's sublayers (lora_A/B, and the DoRA
+    ``lora_magnitude_vector``) are aligned to the base-layer device via peft's
+    type-agnostic ``_move_adapter_to_device_of_base_layer``. This is correct for
+    Linear/Embedding/Conv as well as parameter-based ``ParamWrapper`` (MoE experts via
+    ``target_parameters``), whose base layer has no ``.weight`` and which overrides the
+    method to use ``get_param().device``. This replaces the previous hand-rolled,
+    Linear-only device handling that hard-coded ``base_layer.weight.device``.
 
     Args:
         model: The PEFT model to patch
@@ -522,32 +508,11 @@ def patch_lora_merge(model, parameter_group=None):
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         if parameter_group and all(self.name not in pg for pg in parameter_group):
             return  # Skip if not in target parameter group
-        adapter_names = check_adapters_to_merge(self, adapter_names)
-        if not adapter_names:
-            return
-
-        for active_adapter in adapter_names:
-            if active_adapter in self.lora_A.keys():
-                base_layer = self.get_base_layer()
-                if self.use_dora.get(active_adapter, False):
-                    self.lora_magnitude_vector[active_adapter].weight.data = \
-                        self.lora_magnitude_vector[active_adapter].weight.data.to(base_layer.weight.device)
-
+        for active_adapter in check_adapters_to_merge(self, adapter_names) or []:
+            # Align adapter sublayers (lora_A/B, DoRA magnitude, ...) to the base device.
+            # Type-agnostic: ParamWrapper overrides this to use get_param().device.
+            self._move_adapter_to_device_of_base_layer(active_adapter)
         return self.merge_origin(safe_merge, adapter_names)
-
-    def get_delta_weight(self, adapter) -> torch.Tensor:
-        # Ensure tensors are on correct device
-        if isinstance(self, lora.Embedding):
-            self.lora_embedding_A[adapter].data = self.lora_embedding_A[adapter].data.to(self.base_layer.weight.device)
-            self.lora_embedding_B[adapter].data = self.lora_embedding_B[adapter].data.to(self.base_layer.weight.device)
-        else:
-            self.lora_A[adapter].weight.data = self.lora_A[adapter].weight.data.to(self.base_layer.weight.device)
-            self.lora_B[adapter].weight.data = self.lora_B[adapter].weight.data.to(self.base_layer.weight.device)
-        return self.get_delta_weight_origin(adapter).to(self.base_layer.weight.device)
-
-    def _cache_pop(self, key: str) -> Any:
-        value = self._caches.pop(key).to(self.base_layer.weight.device)
-        return value
 
     # Patch all LoraLayer instances
     for name, module in model.named_modules():
@@ -556,38 +521,32 @@ def patch_lora_merge(model, parameter_group=None):
             if not hasattr(module, 'merge_origin') and hasattr(module, 'base_layer'):
                 module.merge_origin = module.merge
                 module.merge = MethodType(merge, module)
-                module.get_delta_weight_origin = module.get_delta_weight
-                module.get_delta_weight = MethodType(get_delta_weight, module)
-                module._cache_pop_origin = module._cache_pop
-                module._cache_pop = MethodType(_cache_pop, module)
 
     try:
         yield model
     finally:
         # Cleanup: restore original methods
         for module in model.modules():
-            if isinstance(module, LoraLayer):
-                if hasattr(module, 'merge_origin'):
-                    module.merge = module.merge_origin
-                    del module.merge_origin
-                    module.get_delta_weight = module.get_delta_weight_origin
-                    del module.get_delta_weight_origin
-                    module._cache_pop = module._cache_pop_origin
-                    del module._cache_pop_origin
+            if isinstance(module, LoraLayer) and hasattr(module, 'merge_origin'):
+                module.merge = module.merge_origin
+                del module.merge_origin
 
 
 @contextmanager
 def patch_lora_unmerge(model):
+    """Patch LoraLayer.unmerge to align adapter sublayers to the base device first.
+
+    Mirrors ``patch_lora_merge``'s device handling (via peft's type-agnostic
+    ``_move_adapter_to_device_of_base_layer``) so unmerge works under DeepSpeed Zero3 /
+    offload and for parameter-based ``ParamWrapper`` layers.
+    """
 
     def unmerge_patched(self):
         if not self.merged:
             return
-        # Move magnitude vectors to correct device first
+        # Move adapter sublayers (incl. DoRA magnitude) to the base device first
         for adapter in list(self.merged_adapters):
-            if self.use_dora.get(adapter, False):
-                self.lora_magnitude_vector[adapter].weight.data = \
-                    self.lora_magnitude_vector[adapter].weight.data.to(self.base_layer.weight.device)
-
+            self._move_adapter_to_device_of_base_layer(adapter)
         return self.unmerge_origin()
 
     for module in model.modules():
@@ -611,6 +570,9 @@ def profiling_context(trainer, name: str):
     end_time = time.perf_counter()
     duration = end_time - start_time
 
+    if trainer is None:
+        return
+
     profiling_metrics = {f'profiling/Time taken: {trainer.__class__.__name__}.{name}': duration}
 
     is_main_process = False
@@ -622,7 +584,7 @@ def profiling_context(trainer, name: str):
     if 'wandb' in trainer.args.report_to and wandb.run is not None and is_main_process:
         wandb.log(profiling_metrics, commit=False)
 
-    if 'swanlab' in trainer.args.report_to and swanlab.get_run() is not None and is_main_process:
+    if 'swanlab' in trainer.args.report_to and swanlab_get_run() is not None and is_main_process:
         swanlab.log(profiling_metrics)
 
 
@@ -728,9 +690,55 @@ def load_pil_img(img) -> Image:
         raise ValueError("Image dictionary must contain either 'bytes' or 'path' key.")
 
 
+def get_response_prefix_ids(template: Template,
+                            sample_enable_thinking: Optional[bool] = None,
+                            *,
+                            chat_template_kwargs: Optional[Dict[str, Any]] = None) -> Optional[List[int]]:
+    # Use the same precedence and model-specific overrides as rollout encoding.
+    kwargs = dict(chat_template_kwargs or {})
+    if sample_enable_thinking is not None:
+        kwargs['enable_thinking'] = sample_enable_thinking
+    inputs = StdTemplateInputs(messages=[], chat_template_kwargs=kwargs)
+    prefix_str = template._get_response_prefix(inputs)
+    if prefix_str:
+        return template.tokenizer.encode(prefix_str, add_special_tokens=False)
+    return None
+
+
+def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_only: bool = False) -> Dict[str, Any]:
+    """Encode a sample into a template.encode output dict.
+
+    Does NOT mutate ``sample.messages`` — works on a copy from
+    ``to_template_dict()`` so the sample's original messages are preserved
+    for logging / reward computation / reuse across steps_per_generation.
+
+    Resolve the response prefix with the same per-sample chat template
+    settings as rollout, and exclude the injected prefix from the loss.
+    """
+    data = sample.to_template_dict()
+    if sample.response_token_ids:
+        loss_mask = sample.response_loss_mask or None
+        msgs = data.get('messages')
+        if msgs is not None:
+            msgs = [m.copy() for m in msgs]
+        ctk = sample.extra.get('chat_template_kwargs') or {}
+        prefix_ids = get_response_prefix_ids(template, chat_template_kwargs=ctk)
+        data['messages'] = replace_assistant_response_with_ids(
+            msgs, sample.response_token_ids, loss_mask, non_thinking_prefix_ids=prefix_ids)
+
+    if encode_prompt_only:
+        messages = data.get('messages', [])
+        if messages and messages[-1].get('role') == 'assistant':
+            data = {**data, 'messages': messages[:-1] + [{**messages[-1], 'content': None}]}
+
+    encoded = template.encode(data, return_length=True)
+    return encoded
+
+
 def replace_assistant_response_with_ids(messages: 'Messages',
                                         completion_ids: List[Union[int, List[int]]],
-                                        loss_mask: Optional[List[List[int]]] = None) -> 'Messages':  # noqa
+                                        loss_mask: Optional[List[List[int]]] = None,
+                                        non_thinking_prefix_ids: Optional[List[int]] = None) -> 'Messages':  # noqa
     """
     Replace assistant messages in a conversation with token IDs (and optional loss masks).
 
@@ -784,6 +792,21 @@ def replace_assistant_response_with_ids(messages: 'Messages',
     if loss_mask and isinstance(loss_mask[0], int):
         loss_mask = [loss_mask]
 
+    # The prefix was prompt context during rollout, not part of the sampled IDs.
+    # Copy the outer lists so repeated encoding does not mutate the stored rollout.
+    if non_thinking_prefix_ids:
+        completion_ids = list(completion_ids)
+        loss_mask = list(loss_mask) if loss_mask is not None else [[1] * len(ids) for ids in completion_ids]
+        n_prefix = len(non_thinking_prefix_ids)
+        last_ids = list(completion_ids[-1])
+        # Multi-turn schedulers may already have inserted and masked the prefix.
+        # Matching token values alone cannot distinguish that from a sampled repetition.
+        prefix_is_masked = (
+            last_ids[:n_prefix] == list(non_thinking_prefix_ids) and loss_mask[-1][:n_prefix] == [0] * n_prefix)
+        if not prefix_is_masked:
+            completion_ids[-1] = list(non_thinking_prefix_ids) + last_ids
+            loss_mask[-1] = [0] * n_prefix + list(loss_mask[-1])
+
     if loss_mask:
         assert (
             len(completion_ids) == len(loss_mask)
@@ -812,6 +835,77 @@ def replace_assistant_response_with_ids(messages: 'Messages',
         completion_index += 1
 
     return messages
+
+
+def parse_prompt_logprobs(response, topk: int) -> Tuple[List[List[float]], List[List[int]]]:
+    """Parse vLLM prompt_logprobs into per-position (logprobs, token_ids).
+
+    vLLM's ``prompt_logprobs[i]`` is ``{token_id: {logprob, rank, ...}}`` for predicting
+    prompt token ``i`` (position 0 is ``None`` and skipped).
+
+    - ``topk == 0`` (sampled-token, OPD-RL): the teacher was queried with
+      ``prompt_logprobs=0``, so each position holds exactly the *sampled* (actually-present)
+      token — take that single entry. This is token-in-token-out, NOT the top-1: the
+      sampled token may have any rank.
+    - ``topk > 0`` (top-k, GKD): the ``topk`` highest-probability tokens, ordered by logprob
+      (== rank order). The sampled token, if returned as an extra ``k+1``-th entry, is dropped.
+    """
+    raw = response.prompt_logprobs or []
+    lps: List[List[float]] = []
+    ixs: List[List[int]] = []
+    for pos_lp in raw[1:]:
+        if topk == 0:
+            # prompt_logprobs=0 -> a single entry: the sampled (actually-present) token.
+            tid, info = next(iter(pos_lp.items()))
+            lps.append([info['logprob']])
+            ixs.append([int(tid)])
+        else:
+            items = sorted(pos_lp.items(), key=lambda x: -x[1]['logprob'])[:topk]
+            lps.append([info['logprob'] for _, info in items])
+            ixs.append([int(tid) for tid, _ in items])
+    return lps, ixs
+
+
+def assemble_teacher_topk_logprobs(
+    parsed: List[Tuple[List[List[float]], List[List[int]]]],
+    batch_size: int,
+    seq_len: int,
+    cu_seqlens: Optional[List[int]],
+    topk: int,
+    device: torch.device,
+    offsets: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    is_packed = cu_seqlens is not None
+
+    if is_packed:
+        total_len = seq_len
+        out_lp = torch.full((total_len, topk), float('-inf'), dtype=torch.float32)
+        out_ix = torch.zeros(total_len, topk, dtype=torch.long)
+        num_seqs = len(cu_seqlens) - 1
+        assert len(parsed) == num_seqs, f'parsed length {len(parsed)} != num_seqs {num_seqs}'
+        for i in range(num_seqs):
+            start, end = cu_seqlens[i], cu_seqlens[i + 1]
+            lps, ixs = parsed[i]
+            length = min(len(lps), end - start)
+            if length <= 0:
+                continue
+            out_lp[start:start + length] = torch.tensor(lps[:length], dtype=torch.float32)
+            out_ix[start:start + length] = torch.tensor(ixs[:length], dtype=torch.long)
+        return out_lp.unsqueeze(0).to(device), out_ix.unsqueeze(0).to(device)
+
+    out_lp = torch.full((batch_size, seq_len, topk), float('-inf'), dtype=torch.float32)
+    out_ix = torch.zeros(batch_size, seq_len, topk, dtype=torch.long)
+    assert len(parsed) == batch_size, f'parsed length {len(parsed)} != batch_size {batch_size}'
+    for idx in range(batch_size):
+        lps, ixs = parsed[idx]
+        P = len(lps)
+        start = offsets[idx] if offsets is not None else 0
+        length = min(P, seq_len - start)
+        if length <= 0:
+            continue
+        out_lp[idx, start:start + length] = torch.tensor(lps[:length], dtype=torch.float32)
+        out_ix[idx, start:start + length] = torch.tensor(ixs[:length], dtype=torch.long)
+    return out_lp.to(device), out_ix.to(device)
 
 
 def patch_save_last_checkpoint():
@@ -896,6 +990,7 @@ def _get_moe_model_registry():
         ('vllm.model_executor.models.qwen2_moe', ('Qwen2MoeForCausalLM', ), 'mlp'),
         ('vllm.model_executor.models.qwen3_moe', ('Qwen3MoeForCausalLM', ), 'mlp'),
         ('vllm.model_executor.models.qwen3_vl_moe', ('Qwen3MoeLLMForCausalLM', ), 'mlp'),
+        ('vllm.model_executor.models.qwen3_5', ('Qwen3_5MoeForCausalLM', ), 'mlp'),
         ('vllm.model_executor.models.qwen3_next', ('Qwen3NextForCausalLM', ), 'mlp'),
         ('vllm.model_executor.models.kimi_vl', ('KimiVLForConditionalGeneration', ), 'mlp'),
     ]
@@ -918,7 +1013,7 @@ def _get_moe_model_registry():
     return _moe_model_registry_cache
 
 
-def patch_vllm_moe_model_weight_loader(model):
+def patch_vllm_moe_model_weight_loader(model, *, load_preprocessed_weight: bool = False):
     """
     Patch vLLM MoE model to add weight_loader attribute to expert weights.
 
@@ -928,11 +1023,13 @@ def patch_vllm_moe_model_weight_loader(model):
 
     Args:
         model: The vLLM model to patch.
+        load_preprocessed_weight: Whether Ascend MoE expert loaders should write
+            checkpoint layout for a subsequent post-load processing pass.
     """
-    # Check if already patched (idempotent).
-    # Note: the flag can be lost when vLLM sleep/wake_up recreates the model
-    # object, so the expensive import step is cached in _get_moe_model_registry.
-    if getattr(model, '_swift_moe_weight_loader_patched', False):
+    # Check if already patched (idempotent). On NPU/vLLM-Ascend, sleep/wake
+    # and full-model reload can recreate expert Parameters while keeping this
+    # model-level flag, so the loader needs to be reattached every reload.
+    if getattr(model, '_swift_moe_weight_loader_patched', False) and not is_torch_npu_available():
         return
 
     supported_moe_models, mlp_attr_mapping = _get_moe_model_registry()
@@ -960,10 +1057,23 @@ def patch_vllm_moe_model_weight_loader(model):
     # Handle Qwen3-VL MoE structure
     if type(inner_model).__name__ == 'Qwen3MoeLLMForCausalLM':
         inner_model = inner_model.model
+    if type(inner_model).__name__ == 'Qwen3_5MoeForCausalLM':
+        inner_model = inner_model.model
 
     # Check if inner_model has layers attribute
     if not hasattr(inner_model, 'layers'):
         return
+
+    def maybe_patch_vllm_ascend_moe_expert_weight_loader(experts, name, param):
+        if not is_torch_npu_available():
+            return
+        from swift.model.npu_patch.vllm_ascend import patch_vllm_ascend_moe_expert_weight_loader
+        patch_vllm_ascend_moe_expert_weight_loader(
+            experts,
+            name,
+            param,
+            load_preprocessed_weight=load_preprocessed_weight,
+        )
 
     for layer in inner_model.layers:
         mlp_attr = mlp_attr_mapping.get(original_model_type, 'mlp')
@@ -981,38 +1091,136 @@ def patch_vllm_moe_model_weight_loader(model):
             if 'w13_weight' in name or 'w2_weight' in name:
                 if not hasattr(param, 'weight_loader'):
                     param.weight_loader = experts.weight_loader
+                maybe_patch_vllm_ascend_moe_expert_weight_loader(experts, name, param)
 
     # Mark the model as patched (for idempotency)
     original_model._swift_moe_weight_loader_patched = True
 
 
-def finish_vllm_weight_reload(vllm_model):
-    """Re-run ``process_weights_after_loading`` on every FusedMoE layer after
-    an in-place vLLM weight update.
-
-    Without this, the second ``model.load_weights`` of an RL training step
-    writes raw checkpoint-format data over the kernel-format buffers and
-    silently corrupts forward output (vLLM issue #42821).
-    """
-    if vllm_model is None:
+def finish_vllm_weight_reload(vllm_model, model_config, target_device, *, strict: bool = False):
+    if vllm_model is None or model_config is None or target_device is None:
         return
     try:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-    except (ImportError, AttributeError):
-        return  # vLLM is too old to have FusedMoE; nothing to fix.
-    logger = get_logger()
-    for module in vllm_model.modules():
-        if not isinstance(module, FusedMoE):
-            continue
-        quant_method = getattr(module, 'quant_method', None)
-        if quant_method is None or not hasattr(quant_method, 'process_weights_after_loading'):
-            continue
+        from vllm.model_executor.model_loader import utils as model_loader_utils
+
+        # Older vLLM releases do not expose the post-load helper.
+        process_weights_after_loading = getattr(model_loader_utils, 'process_weights_after_loading', None)
+        if process_weights_after_loading is None:
+            return
+        target_device = torch.device(target_device)
+        process_weights_after_loading(vllm_model, model_config, target_device)
+    except Exception:
+        if strict:
+            raise
+
+
+_cached_reverse_renamings = None
+
+# Models whose vLLM ``load_weights`` path expects *checkpoint-style* per-expert MoE
+# keys, while HF runtime packs them via ``WeightConverter`` (e.g. MergeModulelist).
+# For these, rename-only revert is insufficient — experts must be unpacked back to
+# HF checkpoint keys. Other MoE families (Qwen2/3-MoE, Mixtral, ...) keep fused
+# runtime tensors for the existing MoE weight-loader patch.
+_VLLM_CHECKPOINT_STYLE_PACKED_MOE_MODEL_TYPES = frozenset({'nemotron_h'})
+
+
+def _build_reverse_renamings(model):
+    """Build and cache reverse WeightRenaming rules for the given model.
+
+    Only one model type goes through weight sync per training run, so a single
+    module-level variable suffices. Returns None if no renamings apply.
+    """
+    global _cached_reverse_renamings
+    if _cached_reverse_renamings is not None:
+        return _cached_reverse_renamings
+
+    try:
+        from transformers.core_model_loading import WeightRenaming
+    except ImportError:
+        return None
+
+    weight_conversions = getattr(model, '_weight_conversions', None)
+    if weight_conversions is None:
         try:
-            quant_method.process_weights_after_loading(module)
-        except Exception as e:  # noqa: BLE001
-            logger.warning('finish_vllm_weight_reload: process_weights_after_loading failed '
-                           'on %s: %s',
-                           type(module).__name__, e)
+            from transformers.conversion_mapping import get_model_conversion_mapping
+            weight_conversions = get_model_conversion_mapping(model, add_legacy=False)
+        except Exception:
+            return None
+    if not weight_conversions:
+        return None
+
+    renamings = [c for c in weight_conversions if isinstance(c, WeightRenaming)]
+    if not renamings:
+        return None
+
+    # Reverse order before inverting, matching transformers' own revert_weight_conversion
+    # (core_model_loading.py) which reverses the list so that chained renamings undo
+    # in the correct order.
+    try:
+        _cached_reverse_renamings = [c.reverse_transform() for c in renamings[::-1]]
+    except Exception as e:
+        logger = get_logger()
+        logger.warning(f'Failed to build reverse renamings for {type(model).__name__}: {e}')
+        return None
+
+    return _cached_reverse_renamings
+
+
+def revert_runtime_names_to_checkpoint(model, state_dict):
+    """Map HF runtime param names back to HF checkpoint names before vLLM weight sync.
+
+    transformers>=5 may rename checkpoint keys to different *runtime* module names
+    (e.g. gemma4_unified: checkpoint ``model.vision_embedder.*`` -> runtime
+    ``model.embed_vision.*``). vLLM's ``hf_to_vllm_mapper`` is built around the
+    checkpoint names (the same path used by ``vllm serve``), so online weight sync
+    that sends runtime names can land on the wrong vLLM module and raise
+    "There is no module or parameter named ...".
+
+    Default path: revert only the *renaming* part (``WeightRenaming``). Tensor-level
+    ``WeightConverter`` ops (e.g. Qwen/Mixtral MoE fuse) are intentionally skipped and
+    left to the existing MoE weight-loader patch, which expects the fused runtime
+    layout.
+
+    Exception: models in ``_VLLM_CHECKPOINT_STYLE_PACKED_MOE_MODEL_TYPES`` (currently
+    ``nemotron_h``) need transformers ``revert_weight_conversion`` (rename + expert
+    unpack) so the payload matches the HF checkpoint layout that vLLM's
+    ``hf_to_vllm_mapper`` / ``load_weights`` expect. We do **not** emit vLLM-internal
+    names (``embed_tokens``, fused ``w13``, …) — vLLM renames/loads those itself.
+
+    Safe by construction: models whose vLLM mapper accepts runtime names also
+    carry the checkpoint-name rules (required by ``vllm serve``), so reverting to
+    checkpoint names still maps correctly. Any failure or absence of conversions
+    is a no-op that returns the input unchanged.
+    """
+    # Unwrap PEFT to reach the underlying transformers model that holds conversions.
+    if hasattr(model, 'get_base_model'):
+        try:
+            model = model.get_base_model()
+        except Exception:
+            pass
+
+    model_type = getattr(getattr(model, 'config', None), 'model_type', None)
+    if model_type in _VLLM_CHECKPOINT_STYLE_PACKED_MOE_MODEL_TYPES:
+        from transformers.core_model_loading import revert_weight_conversion
+        return revert_weight_conversion(model, state_dict)
+
+    reverse_renamings = _build_reverse_renamings(model)
+    if not reverse_renamings:
+        return state_dict
+
+    try:
+        from transformers.core_model_loading import rename_source_key
+    except ImportError:
+        return state_dict
+
+    new_state_dict = {}
+    for name, param in state_dict.items():
+        try:
+            new_name, _ = rename_source_key(name, reverse_renamings, [])
+        except Exception:
+            new_name = name
+        new_state_dict[new_name] = param
+    return new_state_dict
 
 
 def patch_vllm_load_adapter():
@@ -1063,9 +1271,21 @@ def patch_vllm_load_adapter():
             # loading weights, throwing an exception if validation fails.
             peft_helper.validate_legal(self.lora_config)
             # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
-            # to ensure correct loading of lora weights.
+            # to ensure correct loading of lora weights. Drop the QKV/MLP fusion
+            # substr maps so constituent names (e.g. `q_proj`) survive for the
+            # LoRA manager to pack, matching vllm's own worker_manager._load_adapter.
             model = self._adapter_manager.model
             hf_to_vllm_mapper = getattr(model, 'hf_to_vllm_mapper', None)
+            if hf_to_vllm_mapper is not None:
+                if hasattr(hf_to_vllm_mapper, 'get_unstacked_mapper'):
+                    # vLLM <= 0.27.x
+                    hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
+                elif hasattr(hf_to_vllm_mapper, 'get_rename_mapper'):
+                    # vLLM >= 0.28 renamed get_unstacked_mapper (upstream PR #53106). Without this the
+                    # q_proj/k_proj/v_proj LoRA names are rewritten to the stacked qkv_proj name, and
+                    # set_lora then receives a single tensor where a list of slices is required
+                    # (IndexError in ColumnParallelLinearWithLoRA.set_lora).
+                    hf_to_vllm_mapper = hf_to_vllm_mapper.get_rename_mapper()
 
             lora_request_kwargs = {
                 'peft_helper': peft_helper,
@@ -1142,9 +1362,32 @@ def expand_vllm_param_name_aliases(param_names: set[str]) -> set[str]:
     return expanded
 
 
+def vllm_lora_uses_raw_param_names() -> bool:
+    """Whether vLLM expects sync names without the ``*.base_layer`` suffix for LoRA-wrapped modules.
+
+    vLLM <= 0.27.x loads weights by recursing into the LoRA wrapper's ``base_layer`` submodule, so sync
+    names must use the ``*.base_layer.weight / .bias`` form. Upstream PR #39935 (first released in
+    v0.28.0) added ``BaseLayerWithLoRA.load_weights``, which forwards the weights straight to the wrapped
+    base layer; ``AutoWeightsLoader`` then stops recursing and raw names are required instead.
+    """
+    if not is_vllm_available():
+        return False
+    try:
+        from vllm.lora.layers.base import BaseLayerWithLoRA
+    except ImportError:
+        return check_vllm_version_ge('0.28.0')
+    return 'load_weights' in BaseLayerWithLoRA.__dict__
+
+
 def add_base_layer_suffix_by_param_names(weight_iterator: Iterable[Tuple[str, Any]],
                                          vllm_param_names: set[str]) -> Iterable[Tuple[str, Any]]:
-    """Map HF dense param names to vLLM LoRA-wrapped modules (*.base_layer.weight / .bias)."""
+    """Map HF dense param names to the load names vLLM's LoRA-wrapped modules expect."""
+    if vllm_lora_uses_raw_param_names():
+        # See vllm_lora_uses_raw_param_names: the wrapper forwards load_weights itself, so the
+        # *.base_layer.* suffix must be dropped instead of added.
+        for name, tensor in weight_iterator:
+            yield name.replace('.base_layer.', '.'), tensor
+        return
     for name, tensor in weight_iterator:
         if '.base_layer.' in name or '.' not in name:
             yield name, tensor
@@ -1348,6 +1591,9 @@ def get_chord_sft_dataloader(trainer,
         'pin_memory': trainer.args.dataloader_pin_memory,
         'persistent_workers': trainer.args.dataloader_persistent_workers,
     }
+    mp_context = getattr(trainer.args, 'dataloader_multiprocessing_context', None)
+    if mp_context is not None and trainer.args.dataloader_num_workers > 0:
+        dataloader_params['multiprocessing_context'] = mp_context
 
     if not isinstance(dataset, torch.utils.data.IterableDataset):
         if sampler_fn is not None:
@@ -1403,6 +1649,7 @@ def compute_chord_loss(trainer, grpo_loss: torch.Tensor) -> torch.Tensor:
     chord_sft_loss = torch.tensor(0.0, device=grpo_loss.device, dtype=grpo_loss.dtype)
     if mu > 0:
         sft_inputs = next(trainer.chord_sft_iterator)
+        sft_inputs = to_device(sft_inputs, 'cpu')
         sft_inputs = to_device(trainer.template.data_collator(sft_inputs), trainer.accelerator.device)
 
         labels = sft_inputs.pop('labels')
@@ -1464,6 +1711,57 @@ def set_expandable_segments(enable: bool) -> None:
     if torch.cuda.is_available():
         torch.cuda.memory._set_allocator_settings(f'expandable_segments:{enable}')
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = f'expandable_segments:{enable}'
+
+
+def _vllm_sleep_accepts_mode(engine) -> bool:
+    """Whether the engine's ``sleep`` API accepts the pause ``mode`` argument (vLLM >= 0.20)."""
+    try:
+        return 'mode' in inspect.signature(engine.sleep).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def vllm_sleep(engine, sleep_level: int) -> None:
+    """Put a colocated vLLM engine to sleep, pausing with ``mode='keep'`` when supported.
+
+    ``sleep(level>=1)`` resets the prefix cache; vLLM v0.29-v0.31 (guard added by upstream PR
+    vllm-project/vllm#45635, removed on main after v0.31.0 by #59060) rejects that reset while the
+    AuxOutput connector (``enable_return_routed_experts``) is active unless the scheduler was paused
+    with ``mode='keep'``. ``keep`` pauses with PAUSED_ALL and waits for scheduled outputs to drain,
+    matching the rollout-then-train handover this is called from.
+    """
+    if _vllm_sleep_accepts_mode(engine):
+        engine.sleep(sleep_level, mode='keep')
+    else:
+        engine.sleep(sleep_level)
+
+
+async def vllm_sleep_async(engine, sleep_level: int) -> None:
+    """Async variant of :func:`vllm_sleep` for the Ray rollout engine (``AsyncLLM``)."""
+    if _vllm_sleep_accepts_mode(engine):
+        await engine.sleep(sleep_level, mode='keep')
+    else:
+        await engine.sleep(sleep_level)
+
+
+def sleep_vllm_engine(engine, sleep_level: int, suppress_errors: bool = False) -> None:
+    """Release colocated vLLM memory while attempting every cleanup operation."""
+    cleanup_error = None
+    operations = [
+        ('reset the prefix cache', engine.reset_prefix_cache),
+        ('put the engine to sleep', lambda: vllm_sleep(engine, sleep_level)),
+        ('empty the device cache', aggressive_empty_cache),
+        ('restore expandable segments', lambda: set_expandable_segments(True)),
+    ]
+    for operation, callback in operations:
+        try:
+            callback()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+            get_logger().warning(f'Failed to {operation} during vLLM cleanup: {error}')
+    if cleanup_error is not None and not suppress_errors:
+        raise cleanup_error
 
 
 def peft_config_to_dict(peft_config):
@@ -1645,45 +1943,44 @@ def pad_logps_back_to_batch(logps_rmpad: Optional[torch.Tensor],
         # Compute actual sequence lengths
         seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
 
-    # Compute cumulative sequence lengths
-    cu_seqlens = torch.cumsum(torch.cat([torch.tensor([0], device=device), seq_lengths]), dim=0)
     max_seq_len = logits_to_keep  # All sequences will be padded to this length
-
-    # Initialize output tensors with padding value
-    logps_padded = torch.full((batch_size, max_seq_len), pad_value, dtype=dtype, device=device)
-    valid_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.float32, device=device)
-
-    # Unflatten: assign each sequence's logps to the corresponding row
-    # Use LEFT PADDING (right-align the data) to match the standard padding convention
     logps_flat = logps_rmpad.squeeze(0)  # [total_nnz]
 
-    for i in range(batch_size):
-        start_idx = cu_seqlens[i].item()
-        end_idx = cu_seqlens[i + 1].item()
-        seq_len = int(seq_lengths[i].item())
-
-        actual_end_idx = min(end_idx, len(logps_flat))
-        actual_len = actual_end_idx - start_idx
-
-        if actual_len <= 0:
-            continue
-
-        # Left padding: place data at the RIGHT side of the row
-        # pad_len is the number of padding tokens at the beginning
-        pad_len = max_seq_len - seq_len
-
-        if actual_len < seq_len:
-            # Input data is shorter than expected seq_len
-            # This happens when logps_flat doesn't have enough data
-            # Place actual data at the rightmost positions
-            data_pad_len = max_seq_len - actual_len
-            logps_padded[i, data_pad_len:] = logps_flat[start_idx:actual_end_idx]
-            valid_mask[i, data_pad_len:] = 1.0
-        else:
-            # Normal case: seq_len tokens of data
-            logps_padded[i, pad_len:] = logps_flat[start_idx:end_idx]
+    if batch_size <= 2:
+        cu_seqlens = torch.cat((seq_lengths.new_zeros(1), seq_lengths.cumsum(0)))
+        logps_padded = torch.full((batch_size, max_seq_len), pad_value, dtype=dtype, device=device)
+        valid_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.float32, device=device)
+        for i in range(batch_size):
+            start_idx = cu_seqlens[i].item()
+            end_idx = cu_seqlens[i + 1].item()
+            seq_len = int(seq_lengths[i].item())
+            actual_end_idx = min(end_idx, len(logps_flat))
+            actual_len = actual_end_idx - start_idx
+            if actual_len <= 0:
+                continue
+            pad_len = max_seq_len - actual_len if actual_len < seq_len else max_seq_len - seq_len
+            logps_padded[i, pad_len:] = logps_flat[start_idx:actual_end_idx]
             valid_mask[i, pad_len:] = 1.0
+        return logps_padded, valid_mask
 
+    lengths = seq_lengths.detach().tolist()
+    actual_lengths = []
+    remaining = logps_flat.numel()
+    for seq_len in lengths:
+        actual_lengths.append(min(max(remaining, 0), seq_len))
+        remaining -= seq_len
+
+    logps_flat = logps_flat.to(dtype=dtype)
+    sequences = torch.split(logps_flat[:sum(actual_lengths)], actual_lengths)
+    # Reverse before and after right-padding to support left-padding on older PyTorch versions.
+    logps_padded = pad_sequence([sequence.flip(0) for sequence in sequences], batch_first=True,
+                                padding_value=pad_value).flip(1)
+    if logps_padded.shape[1] < max_seq_len:
+        logps_padded = F.pad(logps_padded, (max_seq_len - logps_padded.shape[1], 0), value=pad_value)
+
+    actual_lengths = torch.tensor(actual_lengths, dtype=torch.long, device=device)
+    positions = torch.arange(max_seq_len, device=device)
+    valid_mask = (positions.unsqueeze(0) >= (max_seq_len - actual_lengths).unsqueeze(1)).to(torch.float32)
     return logps_padded, valid_mask
 
 
@@ -1694,20 +1991,31 @@ def build_completion_mask_and_seq_lengths(
     padding_free: bool = False,
     encoded_batch: Optional[dict] = None,
     device: Optional[torch.device] = None,
+    logits_to_keep: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Build completion_mask and seq_lengths from labels, shared by Ray and non-Ray GRPO paths.
+    """Build completion_mask and seq_lengths from labels, shared by HF / Megatron / Ray GRPO paths.
+
+    Two frame conventions, selected by ``logits_to_keep``:
+
+    - ``logits_to_keep is None`` -> full-sequence frame + roll (Megatron / Ray):
+      ``completion_mask = roll(labels,-1) != -100``, shape ``[B, T_full]``.
+    - ``logits_to_keep is int`` -> completion-region frame, no roll (HF):
+      ``completion_mask = labels[:, -ltk:] != -100``, shape ``[B, ltk]``; the per-sample
+      ``seq_lengths`` (padding_free) contains each sequence's retained suffix length
+      to match HF's ``num_logits_to_keep`` logps frame.
 
     Args:
         labels: Label tensor from data collator.
         batch_size: Number of samples in the batch.
         padding_free: Whether padding-free (rmpad) mode is used.
-        encoded_batch: The full encoded batch dict (needed for cu_seq_lens / attention_mask).
+        encoded_batch: The full encoded batch dict (needed for cu_seq_lens / attention_mask / position_ids).
         device: Target device for output tensors.
+        logits_to_keep: Region width for the HF frame; ``None`` selects the full-sequence frame.
 
     Returns:
         (completion_mask, seq_lengths, max_seq_len) where:
-        - completion_mask: [batch_size, max_seq_len] bool tensor
-        - seq_lengths: [batch_size] int tensor
+        - completion_mask: ``[B, max_seq_len]`` bool tensor
+        - seq_lengths: ``[B]`` int tensor of per-sample lengths
         - max_seq_len: int
     """
     if device is None:
@@ -1715,50 +2023,79 @@ def build_completion_mask_and_seq_lengths(
     if encoded_batch is None:
         encoded_batch = {}
 
-    rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
-
-    if padding_free:
-        if 'cu_seq_lens_q' in encoded_batch:
-            cu = encoded_batch['cu_seq_lens_q']
+    if logits_to_keep is None:
+        # Full-sequence frame + roll (Megatron / Ray)
+        rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
+        if padding_free:
+            if 'cu_seq_lens_q' in encoded_batch:
+                cu = encoded_batch['cu_seq_lens_q']
+            else:
+                cu = get_packed_seq_params(encoded_batch['position_ids'])['cu_seq_lens_q']
+            seq_lengths = cu[1:] - cu[:-1]
+            max_seq_len = int(seq_lengths.max().item())
+            completion_mask_rmpad = (rolled_labels != -100).float()
+            completion_mask, _ = pad_logps_back_to_batch(
+                logps_rmpad=completion_mask_rmpad,
+                logits_to_keep=max_seq_len,
+                batch_size=batch_size,
+                seq_lengths=seq_lengths,
+                pad_value=0.0)
+            completion_mask = completion_mask.bool()
         else:
-            cu = get_packed_seq_params(encoded_batch['position_ids'])['cu_seq_lens_q']
-        seq_lengths = cu[1:] - cu[:-1]
-        max_seq_len = int(seq_lengths.max().item())
-        completion_mask_rmpad = (rolled_labels != -100).float()
+            attention_mask = encoded_batch.get('attention_mask')
+            if attention_mask is not None:
+                if attention_mask.dim() == 4:
+                    attention_mask = attention_mask[:, 0, 0, :]
+                seq_lengths = attention_mask.sum(dim=-1).to(torch.int64)
+            else:
+                seq_lengths = torch.full((batch_size, ), labels.shape[-1], dtype=torch.int64, device=device)
+            max_seq_len = labels.shape[-1]
+            completion_mask = (rolled_labels != -100)
+        return completion_mask, seq_lengths, max_seq_len
+
+    # Completion-region frame, no roll (HF); aligns with num_logits_to_keep logps frame.
+    completion_mask_raw = labels[:, -logits_to_keep:] != -100
+    max_seq_len = logits_to_keep
+    if padding_free:
+        position_ids = encoded_batch.get('text_position_ids')
+        if position_ids is None:
+            position_ids = encoded_batch.get('position_ids')
+        position_ids = position_ids.squeeze()
+        cu_seqlens = torch.cat([(position_ids == 0).nonzero(as_tuple=True)[0],
+                                torch.tensor([len(position_ids)]).to(position_ids.device)])
+        cut = cu_seqlens[-1] - logits_to_keep
+        # Intersect each sequence with the retained suffix, preserving empty rows.
+        lengths = (cu_seqlens[1:] - torch.maximum(cu_seqlens[:-1], cut)).clamp(min=0)
+        seq_lengths = lengths
         completion_mask, _ = pad_logps_back_to_batch(
-            logps_rmpad=completion_mask_rmpad,
-            logits_to_keep=max_seq_len,
+            logps_rmpad=completion_mask_raw.float(),
+            logits_to_keep=logits_to_keep,
             batch_size=batch_size,
-            seq_lengths=seq_lengths,
+            seq_lengths=lengths,
             pad_value=0.0)
         completion_mask = completion_mask.bool()
     else:
-        attention_mask = encoded_batch.get('attention_mask')
-        if attention_mask is not None:
-            if attention_mask.dim() == 4:
-                attention_mask = attention_mask[:, 0, 0, :]
-            seq_lengths = attention_mask.sum(dim=-1).to(torch.int64)
-        else:
-            seq_lengths = torch.full((batch_size, ), labels.shape[-1], dtype=torch.int64, device=device)
-        max_seq_len = labels.shape[-1]
-        completion_mask = (rolled_labels != -100)
-
+        completion_mask = completion_mask_raw
+        # Non-padding-free HF frame: every row spans the full region. Return real
+        # per-sample lengths (= region width) instead of an empty tensor, so callers
+        # can treat seq_lengths uniformly regardless of padding_free.
+        seq_lengths = torch.full((batch_size, ), logits_to_keep, dtype=torch.int64, device=device)
     return completion_mask, seq_lengths, max_seq_len
 
 
 def build_rollout_logps(
-    rollout_batch: 'Sequence[Dict[str, Any]]',
+    rollout_logprobs_list: List[Optional[List[List[float]]]],
     completion_mask: torch.Tensor,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
     """Convert per-sample ``rollout_logprobs`` into a [B, T] tensor aligned with completion_mask.
 
-    Shared by Ray GRPOTrainer and non-Ray MegatronGRPOTrainer to avoid
-    duplicating the rollout logprob alignment logic.
+    Data-structure agnostic: callers pass a list of per-sample nested logprobs
+    (``List[List[float]]`` per sample, or ``None``).
 
     Returns None if logprobs are missing or counts don't match.
     """
-    lp_list = [data.get('rollout_logprobs') for data in rollout_batch]
+    lp_list = list(rollout_logprobs_list)
     if not all(lp is not None and lp for lp in lp_list):
         return None
 
@@ -1778,6 +2115,158 @@ def build_rollout_logps(
         completion_indices = completion_mask[i].nonzero(as_tuple=True)[0]
         rollout_per_token_logps[i, completion_indices] = torch.tensor(flat_lps, dtype=torch.float32, device=device)
     return rollout_per_token_logps
+
+
+def _normalize_routed_experts_tensor(value: Any) -> torch.Tensor:
+    routed = value.detach().cpu() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    if routed.dim() >= 4 and routed.shape[0] == 1:
+        routed = routed.squeeze(0)
+    if routed.dim() < 2:
+        raise ValueError(f'Invalid routed_experts shape: {tuple(routed.shape)}')
+    return routed.to(dtype=torch.int64)
+
+
+def _pad_or_trim_routed_experts(routed: torch.Tensor, target_len: int, *, padding_right: bool) -> torch.Tensor:
+    current_len = int(routed.shape[0])
+    if current_len == target_len:
+        return routed
+    if current_len > target_len:
+        return routed[:target_len] if padding_right else routed[-target_len:]
+    pad_len = target_len - current_len
+    pad = [0] * (2 * routed.dim())
+    if padding_right:
+        pad[2 * (routed.dim() - 1) + 1] = pad_len
+    else:
+        pad[2 * (routed.dim() - 1)] = pad_len
+    return torch.nn.functional.pad(routed, tuple(pad), 'constant', 0)
+
+
+def build_routed_experts_batch(
+    samples: List[OnPolicySample],
+    *,
+    seq_lengths: torch.Tensor,
+    max_seq_len: int,
+    template: Template,
+    device: torch.device,
+    router_replay_mode: str = 'disabled',
+    expected_lens: Optional[List[Optional[int]]] = None,
+) -> Optional[torch.Tensor]:
+    """Build the batched ``routed_experts`` model input from per-sample R3 routing.
+
+    Shared by all backends. Each ``sample`` is an :class:`OnPolicySample` carrying
+    ``routed_experts`` (per-sample, seq-first) and ``encoded['length']``. Returns
+    ``None`` when no sample provides routing (and mode is not ``R3``).
+    """
+    if not samples or all(getattr(s, 'routed_experts', None) is None for s in samples):
+        return None
+
+    padding_right = template.padding_side == 'right'
+    n_samples = len(samples)
+    current_seq_lengths = seq_lengths
+    if seq_lengths.size(0) > n_samples:
+        current_seq_lengths = seq_lengths[:n_samples].clone()
+        current_seq_lengths[n_samples - 1] = seq_lengths[n_samples - 1:].sum()
+
+    routed_tensors: List[torch.Tensor] = []
+    for i, (sample, cur_seq_len) in enumerate(zip(samples, current_seq_lengths)):
+        routed_value = getattr(sample, 'routed_experts', None)
+        if routed_value is None:
+            if router_replay_mode == 'R3':
+                raise AssertionError('When router_replay_mode = R3, routed_experts must be in rollout data')
+            return None
+        routed = _normalize_routed_experts_tensor(routed_value)
+        if expected_lens is not None:
+            expected_len = expected_lens[i]
+        else:
+            expected_len = sample.encoded.get('length')
+        experts_seq_len = int(routed.shape[0])
+        if router_replay_mode == 'R3' and expected_len is not None:
+            # vLLM may omit the final token's routing, hence ``expected_len - 1``.
+            if experts_seq_len not in (expected_len, expected_len - 1):
+                raise AssertionError(f'The seq_len of routed_experts({experts_seq_len}) does not match encoded length '
+                                     f'({expected_len}); expected same length or one less.')
+        target_len = int(cur_seq_len.item()) if template.padding_free else max_seq_len
+        routed = _pad_or_trim_routed_experts(routed, target_len, padding_right=padding_right)
+        routed_tensors.append(routed)
+
+    if template.padding_free:
+        return torch.cat(routed_tensors, dim=0).unsqueeze(0).to(device=device)
+    return torch.stack(routed_tensors).to(device=device)
+
+
+def collate_to_grpo_micro_batch(
+    samples: List[OnPolicySample],
+    template: Template,
+    *,
+    device: torch.device,
+    padding_to: Optional[int] = None,
+    router_replay_mode: str = 'disabled',
+    use_logits_to_keep: bool = False,
+) -> Tuple[Dict[str, Any], GRPOBatch]:
+    """Collate ``List[OnPolicySample]`` into ``(model_inputs, grpo_batch)``.
+
+    The single shared collate used by HF / Megatron / Megatron-Ray. Splits the
+    per-sample world into two batch-level halves:
+
+    - ``model_inputs`` (dict): ``data_collator([s.encoded ...])`` plus batch-computed
+      model extras (``routed_experts``). A clean whitelist — ``model(**model_inputs)``
+      needs no key filtering.
+    - ``grpo_batch`` (:class:`GRPOBatch`): ``completion_mask`` / ``truncated_mask`` /
+      ``seq_lengths`` / ``rollout_per_token_logps`` derived purely from the collated batch.
+
+    ``use_logits_to_keep`` selects the completion_mask frame (see
+    :func:`build_completion_mask_and_seq_lengths`):
+    - ``False`` -> full-sequence frame + roll (Megatron / Ray).
+    - ``True`` -> completion-region frame (HF); ``logits_to_keep`` is computed from
+      the collated labels and stored on ``grpo_batch`` for the HF logps path.
+
+    Backend-specific signals (``old_per_token_logps`` / ``ref_per_token_logps`` /
+    ``advantages`` / ``num_items_in_batch``) are filled by the caller afterwards —
+    non-Ray via batch forward, Ray by stacking per-sample remote results. No
+    distributed communication happens here.
+    """
+    encoded_list = [s.encoded for s in samples]
+    # Snapshot encode lengths before ``data_collator``: under Megatron CP it mutates each
+    # ``encoded`` in place, rounding ``length`` up to a multiple of ``cp_size * 2``.
+    expected_lens = [e.get('length') for e in encoded_list]
+    model_inputs = to_device(template.data_collator(encoded_list, padding_to=padding_to), device)
+
+    labels = model_inputs['labels']
+    batch_size = len(samples)
+    logits_to_keep = None
+    if use_logits_to_keep:
+        logits_to_keep = int((labels.shape[-1] - (torch.ne(labels, -100).int().argmax(-1))).max().item())
+    completion_mask, seq_lengths, max_seq_len = build_completion_mask_and_seq_lengths(
+        labels,
+        batch_size,
+        padding_free=template.padding_free,
+        encoded_batch=model_inputs,
+        device=device,
+        logits_to_keep=logits_to_keep,
+    )
+    truncated_mask = torch.tensor([bool(s.is_truncated) for s in samples], dtype=torch.bool, device=device)
+    rollout_per_token_logps = build_rollout_logps([s.rollout_logprobs for s in samples], completion_mask, device)
+
+    routed_experts = build_routed_experts_batch(
+        samples,
+        seq_lengths=seq_lengths,
+        max_seq_len=max_seq_len,
+        template=template,
+        device=device,
+        router_replay_mode=router_replay_mode,
+        expected_lens=expected_lens,
+    )
+    if routed_experts is not None:
+        model_inputs['routed_experts'] = routed_experts
+
+    grpo_batch = GRPOBatch(
+        completion_mask=completion_mask,
+        truncated_mask=truncated_mask,
+        seq_lengths=seq_lengths,
+        rollout_per_token_logps=rollout_per_token_logps,
+        logits_to_keep=logits_to_keep,
+    )
+    return model_inputs, grpo_batch
 
 
 def resolve_reward_funcs(
@@ -1827,90 +2316,3 @@ def make_reward_weights(
                              f'match number of reward functions ({num_funcs})')
         return torch.tensor(reward_weights_cfg, dtype=torch.float32, device=device)
     return torch.ones(num_funcs, dtype=torch.float32, device=device)
-
-
-def detect_async_reward_indices(reward_funcs: list) -> List[int]:
-    import asyncio
-    import torch.nn as nn
-    indices = []
-    for i, func in enumerate(reward_funcs):
-        if not isinstance(func, nn.Module):
-            if asyncio.iscoroutinefunction(func) or asyncio.iscoroutinefunction(getattr(func, '__call__', None)):
-                indices.append(i)
-    return indices
-
-
-def compute_grpo_advantages(
-    rewards_per_func: torch.Tensor,
-    reward_weights: torch.Tensor,
-    num_generations: int,
-    advantage_estimator: str = 'grpo',
-    scale_rewards: str = 'group',
-    kl_in_reward: bool = False,
-    beta: float = 0.0,
-    kl_values: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute advantages from per-function rewards (pure function).
-
-    This implements GRPO / RLOO / REINFORCE++ advantage estimation and
-    normalization.  Both ``MegatronGRPOTrainer._compute_advantages`` and
-    ``GRPOTrainer.compute_advantages`` should delegate to this.
-
-    Args:
-        rewards_per_func: ``[N, n_funcs]`` per-function reward matrix.
-        reward_weights: ``[n_funcs]`` weighting tensor.
-        num_generations: ``K`` — how many completions per prompt.
-        advantage_estimator: ``'grpo'``, ``'rloo'``, or ``'reinforce_plus_plus'``.
-        scale_rewards: ``'batch'``, ``'group'``, ``'none'``, or ``'gdpo'``.
-        kl_in_reward: Whether to subtract KL penalty.
-        beta: KL penalty coefficient.
-        kl_values: ``[N]`` KL values (required if ``kl_in_reward``).
-
-    Returns:
-        ``(advantages, rewards)`` both ``[N]``.
-    """
-    rewards = (rewards_per_func * reward_weights.unsqueeze(0)).nansum(dim=1)
-
-    if kl_in_reward and beta != 0.0 and kl_values is not None:
-        rewards = rewards - beta * kl_values
-
-    K = num_generations
-    grouped = rewards.view(-1, K)
-    group_mean = grouped.mean(dim=1).repeat_interleave(K)
-
-    if advantage_estimator == 'rloo' and K > 1:
-        advantages = rewards * K / (K - 1) - group_mean * K / (K - 1)
-    else:
-        advantages = rewards - group_mean
-
-    std: Optional[torch.Tensor] = None
-    if advantage_estimator == 'reinforce_plus_plus':
-        if scale_rewards == 'batch':
-            std = advantages.std().expand_as(advantages) if advantages.numel() > 1 \
-                else torch.zeros_like(advantages)
-        elif scale_rewards == 'group':
-            std = advantages.view(-1, K).std(dim=1).repeat_interleave(K) if K > 1 \
-                else torch.zeros_like(advantages)
-    else:
-        if scale_rewards == 'batch':
-            std = rewards.std().expand_as(rewards) if rewards.numel() > 1 \
-                else torch.zeros_like(rewards)
-        elif scale_rewards == 'group':
-            std = grouped.std(dim=1).repeat_interleave(K) if K > 1 \
-                else torch.zeros_like(rewards)
-        elif scale_rewards == 'gdpo':
-            num_reward_funcs = rewards_per_func.shape[1]
-            normalized_list = []
-            for i in range(num_reward_funcs):
-                r_i = rewards_per_func[:, i].view(-1, K)
-                g_mean = r_i.mean(dim=1, keepdim=True)
-                g_std = r_i.std(dim=1, keepdim=True) + 1e-8
-                normalized_list.append(reward_weights[i] * ((r_i - g_mean) / g_std).view(-1))
-            summed = sum(normalized_list)
-            advantages = (summed - summed.mean()) / (summed.std() + 1e-8)
-            std = None
-
-    if std is not None and scale_rewards != 'none':
-        advantages = advantages / (std + 1e-4)
-
-    return advantages, rewards

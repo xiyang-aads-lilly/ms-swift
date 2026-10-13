@@ -121,18 +121,23 @@
 - 🔥padding_free: 将一个batch中的数据进行展平而避免数据padding，从而降低显存占用并加快训练（**同一batch的不同序列之间依旧是不可见的**）。默认为False。当前支持CPT/SFT/DPO/GRPO/KTO/GKD。
   - 注意：使用padding_free请结合`--attn_impl flash_attn`使用且"transformers>=4.44"，具体查看[该PR](https://github.com/huggingface/transformers/pull/31629)。（同packing）
   - **相较于packing，padding_free不需要额外的预处理时间，但packing的训练速度更快且显存占用更稳定**。
-- 🔥loss_scale: 训练tokens的loss权重设置。默认为`'default'`。loss_scale包含3种基本策略：'default'、'last_round'、'all'，以及其他策略：'ignore_empty_think'以及agent需要的：'react'、'hermes'、'qwen'、'agentflan'、'alpha_umi'等，可选值参考[loss_scale模块](https://github.com/modelscope/ms-swift/blob/main/swift/loss_scale/mapping.py)。ms-swift 支持了基本策略和其他策略的混用，例如：`'default+ignore_empty_think'`，`'last_round+ignore_empty_think'`。若没有指定基本策略，则默认为'default'，例如：'hermes'与'default+hermes'等价。
+- 🔥loss_scale: 训练tokens的loss权重设置。默认为`'default'`。loss_scale包含3种基本策略：'default'、'last_round'、'all'，以及其他策略：'ignore_empty_think'、'ignore_think_prefix'以及agent需要的：'react'、'hermes'、'qwen'、'agentflan'、'alpha_umi'等，可选值参考[loss_scale模块](https://github.com/modelscope/ms-swift/blob/main/swift/loss_scale/mapping.py)。ms-swift 支持了基本策略和其他策略的混用，例如：`'default+ignore_empty_think'`，`'last_round+ignore_think_prefix'`。若没有指定基本策略，则默认为'default'，例如：'hermes'与'default+hermes'等价。
   - 'default': 所有response（含history）以权重1计算交叉熵损失（**messages中的system/user/多模态tokens以及Agent训练中`tool_response`部分不计算损失**）。（**SFT默认为该值**）
   - 'last_round': 只计算最后一轮response的损失。最后一轮含义为最后一个"user"之后的所有内容。（**RLHF默认为该值**）
   - 'all': 计算所有tokens的损失。（**`swift pt`默认为该值**）
   - 'ignore_empty_think': 忽略空的`'<think>\n\n</think>\n\n'`损失计算。（满足正则匹配`'<think>\\s*</think>\\s*'`即可）。
+  - 'ignore_think_prefix': 忽略response起始的`'<think>\n'`损失计算（无换行时匹配`'<think>'`），后续思考内容和`'</think>'`仍计算损失。
   - 'react', 'hermes', 'qwen': 将`tool_call`部分的loss权重调整为2。
+  - 注意：在"ms-swift>=4.3.1"，支持了多个非基本策略串联使用（依次处理上一个策略的输出片段，权重相乘），例如：`'last_round+hermes+ignore_empty_think'`，其中'last_round'为基础策略，'hermes+ignore_empty_think'为多个非基本策略的串联使用，共用基础策略。
+- disable_ignore_empty_think: 是否禁用对混合思考模型的loss_scale自动追加`ignore_empty_think`策略。默认为`False`，即对混合思考模型（如Qwen3.5-4B）自动在loss_scale后追加`+ignore_empty_think`，使空的`'<think>\n\n</think>\n\n'`不参与损失计算。若用户已手动在loss_scale中指定了`ignore_empty_think`，则不会重复追加。该参数仅在训练时生效，对纯思考模型和非思考模型无效。设置为`True`可关闭此默认行为。
+  - 注意：该参数在"ms-swift>=4.3.1"增加。在"ms-swift<4.3.1"需手动添加`--loss_scale ignore_empty_think`。
 - is_binary_loss_scale: 当loss_scale只可能为0/1时，该语义可被labels替代，将loss_scale为0的部分的labels设置为-100，从而兼容liger_kernel降低显存。默认为None，进行自动设置。
 - sequence_parallel_size: 序列并行大小，默认是1。当前支持CPT/SFT/DPO/GRPO。训练脚本参考[这里](https://github.com/modelscope/ms-swift/tree/main/examples/train/sequence_parallel)。
 - template_backend: 选择template后端，可选为'swift'、'jinja'，默认为'swift'。如果使用jinja，则使用transformers的`apply_chat_template`。
   - 注意：jinja的template后端只支持推理，不支持训练（无法确定损失计算的tokens范围）。
 - response_prefix: response的前缀字符，该参数只在推理时生效。默认为None，根据enable_thinking参数和模版类型确定。
-- enable_thinking: 该参数在推理时生效，代表是否开启thinking模式。默认为None，默认值由模板（模型）类型确定（思考/混合思考模板为True，非思考模板为False）。若enable_thinking为False，则增加非思考前缀，例如Qwen3-8B混合思考模型增加前缀`'<think>\n\n</think>\n\n'`，Qwen3-8B-Thinking则不增加前缀。若enable_thinking为True，则增加思考前缀，例如`'<think>\n'`。注意：该参数的优先级低于`response_prefix`参数。
+- enable_thinking: 该参数在推理时生效，代表是否开启thinking模式。默认为None，默认值由模板（模型）类型确定（混合思考/非思考模板为False，思考模板为True）。若enable_thinking为False，则增加非思考前缀，例如Qwen3-8B混合思考模型增加前缀`'<think>\n\n</think>\n\n'`，Qwen3-8B-Thinking则不增加前缀。若enable_thinking为True，则增加思考前缀，例如`'<think>\n'`。注意：该参数的优先级低于`response_prefix`参数。
+  - 注意："ms-swift<4.3.1"，混合思考模板默认值为True，在"ms-swift>=4.3.1"修改为False。
 - preserve_thinking: 是否在推理和训练时，对历史思考内容进行保留。当设置为True时，则保留所有轮次的思考内容。若设置为False，则只保留最后一轮的思考内容（即最后一个user信息后的内容）。默认为None。
   - 默认行为：对于思考模型（思考/混合思考）或显式开启enable_thinking，我们会在推理和训练时，默认设置为False，只保留最后一轮的思考内容。若训练时的`loss_scale`基本策略不为'last_round'，例如为'default'，则默认为True，不对历史的思考内容进行删除。
 - add_non_thinking_prefix: 该参数只在训练时生效，代表是否对数据样本assistant部分**不以思考标记`'<think>'`开头**的数据样本增加非思考前缀（通常混合思考模型含非思考前缀）。该特性可以让swift内置的数据集可以训练混合思考模型。默认值为True。例如：例如Qwen3-8B混合思考模型的非思考前缀为`'<think>\n\n</think>\n\n'`，Qwen3-8B-Thinking/Instruct的非思考前缀为`''`。注意：训练时，loss_scale的基本策略为last_round，则只对最后一轮做此修改；否则，例如为'default'、'all'，则对每一轮数据做此修改。若设置为False，则不对数据样本增加非思考前缀。
@@ -247,7 +252,7 @@ ENV:
 - 🔥vit_lr: 当训练多模态大模型时，该参数指定vit的学习率，默认为None，等于learning_rate。通常与`--freeze_vit`、`--freeze_aligner`参数结合使用。
   - 提示：在日志中打印的"learning_rate"为`param_groups[0]`的学习率，其中param_groups的顺序依次是vit, aligner, llm（若含可训练参数）。
 - 🔥aligner_lr: 当训练多模态大模型时，该参数指定aligner的学习率，默认为None，等于learning_rate。
-- lr_scheduler_type: lr_scheduler类型，默认为'cosine'。
+- lr_scheduler_type: lr_scheduler类型，默认为'cosine'。常见选择：'linear', 'constant', 'cosine_with_min_lr'。
 - lr_scheduler_kwargs: lr_scheduler其他参数。默认为None。
 - gradient_checkpointing_kwargs: 传入`torch.utils.checkpoint`中的参数。例如设置为`--gradient_checkpointing_kwargs '{"use_reentrant": false}'`。默认为None。
   - 注意：当使用DDP而不使用deepspeed/fsdp，且gradient_checkpointing_kwargs为None，会默认设置其为`'{"use_reentrant": false}'`而避免出现报错。
@@ -290,7 +295,7 @@ ENV:
 - 🔥ddp_find_unused_parameters: 默认为None。
 - 🔥dataloader_num_workers: 默认为None，若是windows平台，则设置为0，否则设置为1。
 - dataloader_pin_memory: 默认为True。
-- dataloader_persistent_workers: 默认为False。
+- dataloader_persistent_workers: 默认为True；当 `dataloader_num_workers=0` 时自动设为False。
 - dataloader_prefetch_factor: 默认为None。若 `dataloader_num_workers > 0`，则设置为2。每个工作进程预先加载的批次数量。2 表示所有工作进程总共会预取 2 * num_workers 个批次。
 - train_dataloader_shuffle: CPT/SFT训练的dataloader是否随机，默认为True。该参数对IterableDataset无效（即对流式数据集失效）。IterableDataset采用顺序的方式读取。
 - optim: 优化器，默认值为 `"adamw_torch"` (对于 torch>=2.8 为 `"adamw_torch_fused"`)。完整的优化器列表请参见 [training_args.py](https://github.com/huggingface/transformers/blob/main/src/transformers/training_args.py) 中的 `OptimizerNames`。
@@ -315,6 +320,7 @@ ENV:
   - 注意：在LLM和多模态LLM中，'all-linear'的行为有所不同。若是LLM则自动寻找除lm_head外的linear并附加tuner；**若是多模态LLM，则默认只在LLM上附加tuner，该行为可以被`freeze_llm`、`freeze_vit`、`freeze_aligner`控制**。
 - 🔥target_regex: 指定lora模块的regex表达式，默认为`None`。如果该值传入，则target_modules参数失效。例如你可以设置`--target_regex '^(language_model).*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'`，将符合该正则的模块指定为LoRA模块。该参数不限于LoRA，可用于其他tuners。
 - target_parameters: 要替换为LoRA的参数名称列表。该参数的行为与 `target_modules` 类似，但传入的应是参数名称而不是模块名称。该特性需要安装"peft>=0.17.0"。例如，在 Hugging Face Transformers 中许多混合专家（MoE）层中，并未使用 `nn.Linear`，而是使用了 `nn.Parameter`。这时可以使用target_parameters参数实现。
+  - 注意：该参数需要设置`lora_dropout`为 0。
 - init_weights: 初始化weights的方法，LoRA可以指定为'true'、'false'、'gaussian'、'pissa'、'pissa_niter_[number of iters]'、'olora'、'loftq'、'lora-ga'，Bone可以指定为'true'、'false'、'bat'。默认值'true'。
 - 🔥modules_to_save: 在已附加tuner后，额外指定一部分原模型模块参与训练和存储。默认为`[]`。该参数不限于LoRA，可用于其他tuners。例如设置为`--modules_to_save embed_tokens lm_head`，在LoRA训练中解开embed_tokens和lm_head层进行训练，这两部分的权重信息最终会保存在`adapter_model.safetensors`中。
 
@@ -497,15 +503,16 @@ Vera使用`target_modules`、`target_regex`、`modules_to_save`三个参数，�
 ## 集成参数
 
 ### 训练参数
-训练参数除包含[基本参数](#基本参数)、[Seq2SeqTrainer参数](#Seq2SeqTrainer参数)、[tuner参数](#tuner参数)外，还包含下面的部分:
+训练参数除包含[基本参数](#基本参数)、[Seq2SeqTrainer参数](#seq2seqtrainer参数)、[tuner参数](#tuner参数)外，还包含下面的部分:
 
 - add_version: 在`output_dir`上额外增加目录`'<版本号>-<时间戳>'`防止权重覆盖，默认为True。
 - check_model: 检查本地模型文件有损坏或修改并给出提示，默认为True。**如果是断网环境，请设置为False**。
 - 🔥create_checkpoint_symlink: 额外创建checkpoint软链接，方便书写自动化训练脚本。best_model和last_model的软链接路径分别为f'{output_dir}/best'和f'{output_dir}/last'。
 - 🔥packing: 使用`padding_free`的方式将不同长度的数据样本打包成**近似**统一长度的样本（packing能保证不对完整的序列进行切分），实现训练时各节点与进程的负载均衡（避免长文本拖慢短文本的训练速度），从而提高GPU利用率，保持显存占用稳定。当使用 `--attn_impl flash_attn` 时，可确保packed样本内的不同序列之间相互独立，互不可见。该参数默认为`False`，目前支持 CPT/SFT/DPO/KTO/GKD以及embedding/reranker/seq_cls任务的packing。注意：**packing会导致数据集样本数减少，请自行调节梯度累加数和学习率**。
-  - 注意：Qwen3-Next/Qwen3.5的packing请使用Megatron-SWIFT，具体参考[Qwen3.5最佳实践](../BestPractices/Qwen3_5-Best-Practice.md)。
+  - 注意：Qwen3-Next的packing请使用Megatron-SWIFT。Qwen3.5的transformers生态padding_free/packing支持请使用"ms-swift>=4.3.1"（或使用Megatron-SWIFT），具体参考[Qwen3.5/Qwen3.6/Qwen3.8最佳实践](../BestPractices/Qwen3_8-Best-Practice.md)。
 - packing_length: packing的长度。默认为None，设置为max_length。
 - packing_num_proc: packing的进程数，默认为1。需要注意的是，不同的`packing_num_proc`，最终形成的packed数据集是不同的。（该参数在流式packing时不生效）。通常不需要修改该值，packing速度远快于tokenize速度。
+- packing_strategy: packing 算法，可选为'binpack'和'sequential'，默认为'binpack'。'binpack'使用 best-fit-decreasing 装箱（会按长度重排样本）；'sequential'使用保序的贪心装箱（next-fit：仅维护一个开放 pack，放不下即 flush），按输入顺序逐条装箱，使样本顺序与每个 pack 的边界跟随顺序采样器（建议配合 packing_num_proc=1 以保证全局顺序）。
 - lazy_tokenize: 是否使用lazy_tokenize。若该参数设置为False，则在训练之前对所有的数据集样本进行tokenize（多模态模型则包括从磁盘中读取图片）。该参数默认为None，在LLM训练中默认为False，而MLLM训练默认为True，节约内存。
   - 注意：若你要进行图像的数据增强，你需要将lazy_tokenize（或streaming）设置为True，并修改Template类中的encode方法。
 - use_logits_to_keep: 通过在`forward`中根据labels传入logits_to_keep，减少无效logits的计算与存储，从而减少显存占用并加快训练速度。默认为None，进行自动选择。
@@ -514,6 +521,8 @@ Vera使用`target_modules`、`target_regex`、`modules_to_save`三个参数，�
 - temperature: 覆盖生成参数。predict_with_generate=True时的temperature，默认0。
 - optimizer: 使用的optimizers插件（优先级高于`--optim`），默认为None。可选optimizers参考[这里](https://github.com/modelscope/ms-swift/blob/main/swift/optimizers/mapping.py)。
 - loss_type: 自定义的loss_type名称。默认为None，使用模型自带损失函数。可选loss参考[这里](https://github.com/modelscope/ms-swift/blob/main/swift/loss/mapping.py)。
+- mrl_dims: Embedding训练的[Matryoshka表征学习（MRL）](https://arxiv.org/abs/2205.13147)维度配置，默认为None。格式为`Dict[int, float]`或Json字符串，key为截断的embedding维度，value为该维度对应的loss权重，例如`'{"32": 1.0, "64": 1.0, "128": 1.0}'`。开启后，trainer会对`last_hidden_state`分别截断到每个维度并做L2归一化，再调用`loss_type`对应的loss加权累加。仅在`task_type='embedding'`下生效。
+  - 注意：可支持的最大embedding维度由模型`config.json`中的`hidden_size`决定，key大于`hidden_size`的KV对将被自动忽略。
 - eval_metric: 自定义eval metric名称。默认为None。可选eval_metric参考[这里](https://github.com/modelscope/ms-swift/blob/main/swift/metrics/mapping.py)。
   - 关于默认值：当`task_type`为'causal_lm', 且`predict_with_generate=True`的情况下默认设置为'nlg'。`task_type` 为'embedding'，根据loss_type，默认值为'infonce' 或 'paired'。`task_type`为'reranker/generative_reranker'，默认值为'reranker'。
 - callbacks: 自定义trainer callback，默认为`[]`。可选callbacks参考[这里](https://github.com/modelscope/ms-swift/blob/main/swift/callbacks/mapping.py)。例如：通过在`callbacks`中添加`deepspeed_elastic`（可选`graceful_exit`）可以来启用弹性训练。参考[Elastic示例](../BestPractices/Elastic.md)
@@ -564,32 +573,33 @@ RLHF参数继承于[训练参数](#训练参数)。
 - temperature: 默认为0.9，该参数将在PPO、GRPO、GKD中使用。
 - top_k: rollout采样的top-k参数，-1表示不进行top-k过滤。默认为-1。
 - top_p: rollout采样的top-p参数，1.0表示不进行top-p过滤。默认为1.0。
+- min_p: rollout采样的min-p参数，概率低于最高概率token概率`min_p`倍的token将被过滤，0.0表示不进行min-p过滤。默认为0.0。仅对vLLM后端生效。
 
 #### GKD参数
 - lmbda: 默认为0.5。该参数在GKD中使用。控制学生数据比例的 lambda 参数（即策略内学生生成输出所占的比例）。若lmbda为0，则不使用学生生成数据。
 - sft_alpha: 默认为0。控制GKD中加入sft_loss的权重。最后的loss为`gkd_loss + sft_alpha * sft_loss`。
-- seq_kd: 默认为False。该参数在GKD中使用。控制是否执行序列级知识蒸馏（Sequence-Level KD）的 seq_kd 参数（可视为对教师模型生成输出的监督式微调）。
-  - 注意：你可以提前对数据集内容使用teacher模型进行推理（使用vllm/sglang/lmdeploy等推理引擎加速），并在训练时将`seq_kd`设置为False。或者将`seq_kd`设置为True，在训练时使用teacher模型生成序列（能保证多个epoch生成数据的不同，但效率较慢）。
-- gkd_logits_topk: 使用 Top-K logits 计算 KL 散度，默认为 None（即使用完整词表计算）。设置该参数可有效降低训练显存峰值；当配置 teacher_model_server 时，此参数为必填项。详见[GKD 文档](./GKD.md#top-k-kl-计算)。
-- offload_teacher_model: 卸载教师模型以节约显存，只在采样/计算logps时加载，默认为False。
+- gkd_logits_topk: 使用 Top-K logits 计算 KL 散度，默认为 None（即使用完整词表计算）。设置该参数可有效降低训练显存峰值；当配置 `teacher_model_server` 时，此参数为必填项。详见[蒸馏文档](./Distillation.md#31-gkd散度作为直接损失)。
 - truncation_strategy: 用于处理输入长度超过 max_length 的样本，支持 delete 和 left 两种策略，分别表示删除该样本和从左侧裁剪。默认值为 left。若使用 delete 策略，被删除的超长样本或编码失败的样本将在原数据集中通过重采样进行替换。
 - log_completions: 是否记录训练中的模型生成内容，搭配 `--report_to wandb/swanlab` 使用。默认为False。
   - 提示：若没有设置`--report_to wandb/swanlab`，则会在checkpoint中创建`completions.jsonl`来存储生成内容。
   - 仅记录 vLLM 采样结果。
 
 #### Reward/Teacher模型参数
-reward模型参数将在PPO、GRPO中使用。
+reward模型参数将在PPO、GRPO中使用；teacher模型参数在GKD与GRPO中使用。
 
 - reward_model: 默认为None。
 - reward_adapters: 默认为`[]`。
 - reward_model_type: 默认为None。
 - reward_model_revision: 默认为None。
-- teacher_model: 默认为None。rlhf_type为'gkd'时需传入此参数。
-- teacher_adapters: 默认为`[]`。
+- teacher_model: 默认为None。
+- teacher_adapters: `teacher_model` 加载的 LoRA 权重路径，默认为`[]`。与 `teacher_model` 一起显式指定时，即使 `teacher_model` 与 `model` 相同，也会加载独立的冻结教师模型（增加一份 base 权重的内存开销），而不使用 `disable_adapter()` 优化。
 - teacher_model_type: 默认为None。
 - teacher_model_revision: 默认为None。
-- teacher_model_server: 教师模型服务地址, 如：`http://localhost:8000`, 使用`vllm serve`部署的服务端计算top-k-logps。
+- teacher_model_server: 教师模型服务地址，通过 `swift deploy` 部署后用于获取 logprobs。支持单 teacher URL（如 `http://localhost:8000`）或多 teacher JSON（如 `'[{"url":"http://t1:8000","tags":["data/math.jsonl"]},{"url":"http://t2:8001","tags":["data/code.jsonl"]}]'`）。`tags` 与数据集或样本标识的对应关系见[蒸馏文档](./Distillation.md#multi-teacher多教师路由)。
+- teacher_tag_key: 多 teacher 路由时，样本用于匹配 teacher `tags` 的字段名，默认为 `"dataset"`。多数据集时按 `--dataset` 各项匹配；也可在数据中自定义列（如 `teacher_tag`）并设为 `--teacher_tag_key teacher_tag`。
 - teacher_deepspeed: 同 deepspeed 参数，控制 teacher model 的 deepspeed 配置，默认使用训练模型的 deepspeed 配置。
+- offload_teacher_model: 卸载教师模型以节约显存，在采样/计算logps时加载，仅在设置teacher_model时生效默认为False。
+
 
 #### PPO参数
 
@@ -642,7 +652,7 @@ reward模型参数将在PPO、GRPO中使用。
   - async_generate: 异步rollout以提高训练速度，注意开启时采样会使用上一轮更新的模型进行采样，不支持多轮场景。默认`false`。
   - enable_flattened_weight_sync: 是否使用 flattened tensor 进行权重同步。启用后会将多个参数打包为单个连续 tensor 进行传输，可提升同步效率，在 Server Mode 下生效，默认为 True。
   - SWIFT_UPDATE_WEIGHTS_BUCKET_SIZE: 环境变量，用于控制flattened tensor 权重同步时的传输桶大小（bucket size），适用于 Server Mode 下的全参数训练，单位为 MB，默认值为 512 MB。
-- vllm_mode colocate 参数（更多参数支持参考[vLLM参数](#vLLM参数)。）
+- vllm_mode colocate 参数（更多参数支持参考[vLLM参数](#vllm参数)。）
   - vllm_gpu_memory_utilization: vllm透传参数，默认为0.9。
   - vllm_max_model_len: vllm透传参数，默认为None。
   - vllm_enforce_eager: vllm透传参数，默认为False。
@@ -670,12 +680,23 @@ reward模型参数将在PPO、GRPO中使用。
 - scale_rewards: 指定奖励的缩放策略。可选值包括 `group`（按组内标准差缩放）、`batch`（按整个批次的标准差缩放）、`none`（不进行缩放）、`gdpo`（对每个奖励函数分别进行组内归一化后加权聚合，参考 [GDPO 论文](https://arxiv.org/abs/2601.05242)）。默认值与 `advantage_estimator` 绑定：`grpo` 对应 `group`，`rloo` 对应 `none`，`reinforce_plus_plus` 对应 `batch`。
   - 注意：`gdpo` 模式不支持 `kl_in_reward=True`，若同时设置会自动将 `kl_in_reward` 设为 `False`。
   - GDPO 适用于多奖励优化场景：当使用多个奖励函数时，GDPO 会对每个奖励函数分别在组内进行标准化（减均值、除标准差），然后使用 `reward_weights` 进行加权求和，最后再进行批次级别的标准化。这种方式可以更好地保留各个奖励的相对差异，避免不同奖励组合坍塌成相同的 advantage 值。
+- teacher_kl_coef: OPD-RL中teacher_kl的系数，即 `adv_t = base_adv + teacher_kl_coef * teacher_kl`。默认为 1.0。
+- advantage_reweight: 优势重加权算法，默认为None（不启用）。可选项为 `rlsd`（[RLSD, Self-Distilled RLVR](https://arxiv.org/abs/2604.03128)）：利用 teacher 与 student 在相同采样 token 上的对数概率差异，将 GRPO 的序列级优势在 token 维度重新分配，即 `delta_t = logP_T(y_t) - logP_S(y_t)`、`w_t = exp(sign(A) * delta_t)`、`reweight = (1 - λ) + λ * clip(w_t)`、`A_hat_t = A * reweight`；reweight 恒为正，不会翻转环境奖励的符号。启用后需满足：已设置 `reward_funcs`（reweight 方向依赖优势符号 `sign(A)`），且数据集包含 `teacher_prompt` 列（特权 prompt，如 问题 + 参考解答/标准答案）；与 `use_liger_kernel`、`loss_type in [real, fipo]`、`off_policy_sequence_mask_delta`、`teacher_model_server` 不兼容。teacher 模式：不设置 `--teacher_model` 时为动态自蒸馏（teacher = 当前策略在特权 prompt 上打分）；设置 `--teacher_model <ckpt>` 时为冻结本地 teacher（在 no_grad 下打分，训练中不更新）。
+- rlsd_lambda: RLSD 混合权重，`reweight = (1 - λ) + λ * clip(w_t)`。`0` 退化为普通 GRPO，`1` 为完整 RLSD 重加权。取值需在 [0, 1]，默认为 0.5。
+- rlsd_reweight_clip_range: 证据权重裁剪范围 eps_w，将 `w_t = exp(sign(A) * delta_t)` 裁剪到 `[1 - eps_w, 1 + eps_w]`，避免 teacher/student 对数概率差异造成过大的倍率。需 >= 0，默认为 0.2。
+- rlsd_lambda_warmup_steps: 将 λ 从 0 线性 warmup 到 `rlsd_lambda` 的步数。默认为 0（不进行 warmup）。
+- rlsd_lambda_decay_steps: 在 warmup 之后，将 λ 从 `rlsd_lambda` 线性衰减到 0 的步数。默认为 0（不衰减，λ 保持恒定）。
+- rlsd_negative_only: 是否仅对优势为负（`A < 0`，即错误回答）的序列进行重加权；优势非负的序列保留普通 GRPO 优势。默认为 False。
+- sdar_loss_coef: SDAR（[Self-Distilled Agentic RL](https://arxiv.org/abs/2605.15155)）置信度门控 teacher 蒸馏辅助损失的系数，叠加到 GRPO 策略损失上：`loss = policy_loss + sdar_loss_coef * L_SDAR`，其中 `L_SDAR = token-mean(sigmoid(sdar_gate_beta * delta_t) * delta_t)`、`delta_t = logP_T(y_t) - logP_S(y_t)`。门控与 teacher 对数概率均 detach，梯度只经由 student 回传。复用 OPSD 自蒸馏 teacher（teacher = 当前策略在特权 `teacher_prompt` 列上打分）得到逐 token 的 teacher 对数概率；与 RLSD 不同，它不修改 GRPO 优势。`> 0` 时启用；与 `use_liger_kernel`、`advantage_reweight=rlsd`、`teacher_model_server` 不兼容。默认为 0.0（不启用）；参考实现使用 0.1（ALFWorld 为 0.01）。
+- sdar_gate_beta: SDAR sigmoid 门控 `sigmoid(sdar_gate_beta * delta_t)` 的温度系数，值越大门控越尖锐。需 > 0，默认为 5.0。
 - sync_ref_model: 是否定期同步ref_model，默认为False。
   - ref_model_mixup_alpha: 控制在更新过程中model和先前ref_model之间的混合。更新公式为 $π_{ref} = α * π_θ + (1 - α) * π_{ref_{prev}}$。默认为0.6。
   - ref_model_sync_steps: 同步频率，默认为512。
 - move_model_batches: 在模型向vLLM等快速推理框架移动参数时，将layers分为多少个batch. 默认为None, 代表整个模型不进行拆分，否则拆分为move_model_batches+1(非layer参数)+1(多模态部分参数)个。
 - multi_turn_scheduler: 多轮GRPO参数, 传入对应的plugin名称, 同时在plugin/multi_turn.py中添加好对应的实现。
 - max_turns: 多轮GRPO的轮数上限。默认为None，不做限制。
+- gym_env: 全局指定 gym 环境名称，需先在 plugin 里注册。默认为None，可在数据集每行 `env_config.name` 中覆盖。具体参考[文档](./GRPO/DeveloperGuide/gym_env.md)。
+- use_gym_env: 是否将 env 给出的 `total_reward` 作为奖励，启用后无需配置 reward 函数。默认为None；未显式传入时，若设置了 `gym_env` 则自动设为True，否则server模式下从rollout继承，其它情况为False。
 - top_entropy_quantile: 仅对熵值处于前指定分位的 token 参与损失计算，默认为1.0，即不过滤低熵 token，具体参考[文档](./GRPO/AdvancedResearch/entropy_mask.md)
 - log_entropy: 记录训练中的熵值变化动态，默认为False，具体参考[文档](./GRPO/GetStarted/GRPO.md#logged-metrics)
 - rollout_importance_sampling_mode: 训推不一致校正模式，可选项为 `token_truncate`、`token_mask`、`sequence_truncate`、`sequence_mask`。默认为None，不启用校正。具体参考[文档](./GRPO/AdvancedResearch/training_inference_mismatch.md)
@@ -702,7 +723,7 @@ soft overlong 奖励参数
 
 ### 推理参数
 
-推理参数除包含[基本参数](#基本参数)、[合并参数](#合并参数)、[vLLM参数](#vllm参数)、[LMDeploy参数](#LMDeploy参数)外，还包含下面的部分：
+推理参数除包含[基本参数](#基本参数)、[合并参数](#合并参数)、[vLLM参数](#vllm参数)、[LMDeploy参数](#lmdeploy参数)外，还包含下面的部分：
 
 - 🔥infer_backend: 推理加速后端，支持'transformers'、'vllm'、'sglang'、'lmdeploy'四种推理引擎。默认为'transformers'。
   - 注意：这四种引擎使用的都是swift的template，使用`--template_backend`控制。
@@ -733,8 +754,11 @@ soft overlong 奖励参数
 Rollout参数继承于[部署参数](#部署参数)
 - multi_turn_scheduler: 多轮GRPO训练规划器，传入对应的plugin名称, 同时在plugin/multi_turn.py中添加好对应的实现。默认为None，具体参考[文档](./GRPO/DeveloperGuide/multi_turn.md)。
 - max_turns: 多轮GRPO训练下的最大轮数，默认为None，即不做约束。
+- gym_env: 全局指定 gym 环境名称，需先在 plugin 里注册。默认为None，可在数据集每行 `env_config.name` 中覆盖。具体参考[文档](./GRPO/DeveloperGuide/gym_env.md)。
+- use_gym_env: 是否启用 gym 环境模式（rollout 输出 `total_reward` 供 trainer 使用）。默认为None，未显式传入时若设置了 `gym_env` 则自动设为True。
 - vllm_enable_lora: 支持vLLM Engine 加载 LoRA adapter，默认为False。用于加速LoRA训练的权重同步，具体参考[文档](./GRPO/GetStarted/GRPO.md#权重同步加速)。
 - vllm_max_lora_rank: vLLM Engine LoRA参数，需大于等于训练的lora_rank，建议等于。默认为16。
+- vllm_enable_expert_parallel: 开启MoE模型的专家并行（EP），将experts分布到不同rank，在vllm_use_async_engine True时生效。默认为False。
 
 ### Web-UI参数
 - server_name: web-ui的host，默认为'0.0.0.0'。
@@ -745,7 +769,7 @@ Rollout参数继承于[部署参数](#部署参数)
 
 ### App参数
 
-App参数继承于[部署参数](#部署参数), [Web-UI参数](#Web-UI参数)。
+App参数继承于[部署参数](#部署参数), [Web-UI参数](#web-ui参数)。
 - base_url: 模型部署的base_url，例如`http://localhost:8000/v1`。默认为`None`，使用本地部署。
 - studio_title: studio的标题。默认为None，设置为模型名。
 - is_multimodal: 是否启动多模态版本的app。默认为None，自动根据model判断，若无法判断，设置为False。
@@ -819,6 +843,10 @@ App参数继承于[部署参数](#部署参数), [Web-UI参数](#Web-UI参数)�
 除了以上参数外，有些模型还支持额外的具体模型参数。这些参数含义通常可以在对应模型官方repo或者其推理代码中找到相应含义。**ms-swift引入这些参数以确保训练的模型与官方推理代码效果对齐**。
 - 特定模型参数可以通过`--model_kwargs`或者环境变量进行设置，例如: `--model_kwargs '{"fps_max_frames": 12}'`或者`FPS_MAX_FRAMES=12`。
 - 注意：若你在训练时指定了特定模型参数，请在推理时也设置对应的参数，这可以提高训练效果。
+
+### deepseek_v4, deepseek_v4_flash, glm5_2, glm5_3, hy_v3_preview
+- 🔥REASONING_EFFORT: 思考强度，仅在开启思考时生效（`glm5_3`除外：它没有非思考模式，该参数始终生效）。取值范围因模型而异：`deepseek_v4`为'high'/'max'（默认'high'）；`deepseek_v4_flash`为'low'/'high'/'max'（默认'low'）；`glm5_2`为'high'/'max'（默认'max'）；`glm5_3`为'low'/'high'/'max'（默认'max'）；`hy_v3_preview`为'no_think'/'low'/'high'（默认'high'）。
+  - 也可以在数据集或推理请求中传入`chat_template_kwargs`进行样本级设置，例如`{"chat_template_kwargs": {"reasoning_effort": "max"}}`，优先级高于环境变量。
 
 ### qwen2_vl, qvq, qwen2_5_vl, mimo_vl, keye_vl, keye_vl_1_5
 参数含义与`qwen_vl_utils<0.0.12`或者`qwen_omni_utils`库中含义一致，可以查看[这里](https://github.com/QwenLM/Qwen2.5-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py#L24)。ms-swift通过修改这些常数值来控制图片分辨率和视频帧率，避免训练时OOM。
@@ -947,3 +975,8 @@ qwen2_5_omni除了包含qwen2_5_vl和qwen2_audio的模型特定参数外，还�
 - SWIFT_TIMEOUT: 若多模态数据集中存在图像URL，该参数用于控制获取图片的timeout，默认为20s。
 - ROOT_IMAGE_DIR: 图像（多模态）资源的根目录。通过设置该参数，可以在数据集中使用相对于 `ROOT_IMAGE_DIR` 的相对路径。默认情况下，是相对于运行目录的相对路径。
 - SWIFT_SINGLE_DEVICE_MODE: 单设备模式，可选值为"0"(默认值)/"1"，在此模式下，每个进程只能看到一个设备。
+- SWIFT_AUDIO_LOAD_BACKEND: 音频波形加载后端。`librosa`（默认）或 `soundfile_pyav`（soundfile 优先、失败时 pyav fallback）。GRPO/GKD训练 在 `--use_vllm true`时默认为 `soundfile_pyav`，保证训练侧 encode 与 vLLM rollout 解析同一音频 URL 时波形一致。
+- SWIFT_ALLOW_INTERNAL_URL: 默认为`'0'`。`swift deploy` 在将请求中的图片、音频和视频 URL 下载为本地临时文件时，会拒绝解析到回环、内网私有网段等非公网地址，以防御 SSRF。媒体 URL 可信且部署服务确实需要访问内网媒体服务器时，可将其设置为`'1'`。云厂商元数据端点（`169.254.0.0/16`、阿里云 `100.100.100.200` 等）无论该开关如何设置都始终被拦截。
+- SWIFT_URL_ALLOWED_HOSTS: 以逗号分隔的 host 白名单，例如 `bucket.oss-cn-hangzhou.aliyuncs.com,cdn.example.com`。设置后，`swift deploy` 仅获取 host 在该列表中的请求媒体 URL；列表中的 host 可以解析到普通内网地址，但云厂商元数据地址仍会被拒绝。部署服务的媒体来自已知存储桶或 CDN 域名时推荐配置。
+- SWIFT_MAX_DOWNLOAD_SIZE_MB: `swift deploy` 获取请求媒体 URL 时单个响应体的大小上限，默认为`1024`（即1GB）。用于防止非信任方通过超大或无限响应耗尽内存和临时磁盘空间。设置为`0`可关闭该限制。
+- SWIFT_MEDIA_ALLOWED_DIRS: 以逗号分隔的**绝对**目录白名单，例如 `/data/images,/data/videos`。设置后，部署请求中引用的本地媒体路径必须位于这些目录内，否则拒绝读取；比较前会解析符号链接与 `..`。默认不设置以保持兼容，此时部署请求仍可读取任意可访问的本地媒体文件。`swift deploy` 暴露给非信任方时应配置该变量；若要禁止请求引用本地文件，可将其指向一个空目录。

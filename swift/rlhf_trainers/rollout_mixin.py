@@ -23,27 +23,34 @@ from queue import Queue
 from torch.nn import ModuleList
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, TrainerCallback
+from transformers.utils import is_torch_npu_available
 from types import MethodType
 from typing import Any, Dict, List, Optional, Union
 
-from swift.infer_engine import RequestConfig
+from swift.infer_engine import RequestConfig, TransformersEngine
 from swift.infer_engine.protocol import ChatCompletionResponse, RolloutInferRequest, RolloutOutput
 from swift.model import MultiModelKeys
-from swift.rollout import MultiTurnScheduler, multi_turns
+from swift.rl_core.data import OnPolicySample
+from swift.rl_core.resample import resample_encode_failed_inputs
+from swift.rollout import MultiTurnScheduler, invoke_async_hook, multi_turns, run_multi_turn
 from swift.sequence_parallel import sequence_parallel
 from swift.template import Template
 from swift.tuners import Swift
 from swift.utils import (get_current_device, get_logger, is_deepspeed_enabled, is_vllm_available, remove_response,
-                         to_device)
-from .arguments import RolloutTrainerArgumentsMixin
+                         to_device, unwrap_model_for_generation)
+from .arguments import GKDConfig, GRPOConfig, RolloutTrainerArgumentsMixin
+from .base_rollout_mixin import BaseRolloutTrainerMixin
+from .gkd_helpers import TeacherServerConfig, parse_teacher_model_server, resolve_dynamic_opd_self_distillation
 from .rlhf_mixin import RLHFTrainerMixin
 from .utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedTensorBucket, TensorLoRARequest,
                     _create_parameter_buckets, _process_bucket_with_flattened_tensor,
                     add_base_layer_suffix_by_param_names, aggressive_empty_cache, check_vllm_version_ge,
                     expand_vllm_param_name_aliases, finish_vllm_weight_reload, get_even_process_data,
-                    get_gather_if_zero3_context, patch_lora_merge, patch_lora_unmerge, patch_vllm_load_adapter,
-                    patch_vllm_moe_model_weight_loader, profiling_context, profiling_decorator, set_expandable_segments,
-                    vllm_supports_lora_load_inplace)
+                    get_gather_if_zero3_context, parse_prompt_logprobs, patch_lora_merge, patch_lora_unmerge,
+                    patch_vllm_load_adapter, patch_vllm_moe_model_weight_loader, prepare_deepspeed, prepare_fsdp,
+                    profiling_context, profiling_decorator, revert_runtime_names_to_checkpoint, set_expandable_segments,
+                    sleep_vllm_engine, vllm_sleep, vllm_supports_lora_load_inplace)
+from .vllm_client import VLLMInferClient
 
 DataType = List[Dict[str, Union[torch.Tensor, Any]]]
 logger = get_logger()
@@ -51,8 +58,9 @@ logger = get_logger()
 
 @dataclass
 class DataCache:
-    """Cache container for rollout results"""
-    results: DataType
+    """A terminal rollout result, including failures raised by the worker."""
+    results: Optional[List['OnPolicySample']] = None
+    error: Optional[BaseException] = None
 
 
 class AsyncGenerateCallback(TrainerCallback):
@@ -80,7 +88,7 @@ class SyncRefModelCallback(TrainerCallback):
         self.trainer._sync_ref_model_weights(args.ref_model_mixup_alpha)
 
 
-class RolloutTrainerMixin(RLHFTrainerMixin):
+class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
     """
     Mixin for RLHF trainers that use rollout-based methods (e.g., GRPO, GKD).
 
@@ -103,6 +111,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         if self.is_fsdp_enabled and not self._is_fsdp2:
             raise NotImplementedError('FSDP1 is not supported. Please use FSDP2 (fsdp_version=2) instead. '
                                       'Set fsdp_version: 2 in your FSDP config or use --fsdp fsdp2')
+        self.args: Union[GRPOConfig, GKDConfig]
 
     def prepare_rollout(self):
         self._prepare_rollout_params()
@@ -111,24 +120,192 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         self._prepare_async_generate()
         self.parameter_groups, self.parameter_groups_no_lora = self.split_batches()
 
-    @staticmethod
-    def _split_data_by_steps(inputs: DataType, steps: int) -> List[DataType]:
-        """Split a list of inputs into `steps` chunks with balanced sizes."""
-        if steps <= 1:
-            return [inputs]
+    @profiling_decorator
+    def _generate_and_score_completions(self, inputs: DataType) -> List[Dict[str, Any]]:
+        """Unified rollout → score → batch pipeline shared by GRPO and GKD.
 
-        chunk_size = len(inputs) // steps
-        remainder = len(inputs) % steps
-        chunks: List[DataType] = []
-        start_idx = 0
-        for i in range(steps):
-            current_chunk_size = chunk_size + (1 if i < remainder else 0)
-            end_idx = start_idx + current_chunk_size
-            chunks.append(inputs[start_idx:end_idx])
-            start_idx = end_idx
-        return chunks
+        The skeleton fixes the stage order so both algorithms (and future ones)
+        read the same way; per-algorithm behavior lives in the hooks below:
 
-    def split_by_mini_batches(self, inputs: DataType) -> List[DataType]:
+        1. ``_rollout_samples``      – raw rows → samples (+ generation).
+        2. ``_score_completions``    – attach the algorithm's per-sample training
+                                       signal (GRPO: rewards + dynamic sampling; GKD: noop).
+        3. ``_prepare_batch_inputs`` – encode + collate samples into per-micro-batch
+                                       ``{model_inputs, <algo>_batch}`` dicts.
+        4. ``_postprocess_batch``    – fill batch-level signals that depend on the
+                                       encoded batches (GRPO: advantages; GKD: teacher logprobs).
+        5. ``_log_rollout``          – log prompts/completions and extra metrics.
+
+        Returns the list of per-micro-batch encoded inputs.
+        """
+        samples = self._rollout_samples(inputs)
+        samples = self._score_completions(samples)
+        batch_encoded_inputs = self._prepare_batch_inputs(samples)
+        self._postprocess_batch(samples, batch_encoded_inputs)
+        self._log_rollout(samples)
+        return batch_encoded_inputs
+
+    def _rollout_samples(self, inputs: DataType) -> List[OnPolicySample]:
+        """Convert raw rows to samples and (optionally) generate completions.
+
+        Hook overridden by each trainer; GRPO always generates, GKD generates only
+        for the on-policy (STUDENT) branch.
+        """
+        raise NotImplementedError
+
+    def _score_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Attach the algorithm's per-sample training signal and return the samples.
+
+        GRPO scores completions with reward functions (and runs DAPO dynamic sampling);
+        GKD has no reward scoring and returns the samples unchanged. Returns samples
+        (rather than a tensor) so the skeleton stays symmetric and resampling can
+        replace the sample set in place.
+        """
+        return samples
+
+    def _prepare_batch_inputs(self, samples: List[OnPolicySample]) -> List[Dict[str, Any]]:
+        """Encode + collate all samples into per-micro-batch ``{model_inputs, <algo>_batch}`` dicts.
+
+        Hook overridden by each trainer; takes all samples and splits internally via
+        ``split_by_mini_batches``.
+        """
+        raise NotImplementedError
+
+    def _postprocess_batch(self, samples: List[OnPolicySample], batch_encoded_inputs: List[Dict[str, Any]]) -> None:
+        """Fill batch-level training signals that depend on the encoded batches.
+
+        Default is a no-op. GRPO computes/writes advantages; GKD fetches/fills teacher logprobs.
+        """
+
+    def _log_rollout(self, samples: List[OnPolicySample]) -> None:
+        """Log prompts/completions and extra rollout metrics. Default no-op."""
+
+    def _pop_teacher_kwargs(self, kwargs: Dict[str, Any]) -> None:
+        """Stash teacher kwargs before ``super().__init__`` consumes them.
+
+        The actual setup (model prepare / API client) runs in ``_setup_teacher`` after the
+        accelerator is ready. ``gkd_logits_topk`` is GKD-only and popped by the GKD trainer.
+        """
+        self._teacher_model = kwargs.pop('teacher_model', None)
+        self._teacher_deepspeed_config = kwargs.pop('teacher_deepspeed_config', None)
+        self.teacher_model_server = kwargs.pop('teacher_model_server', None)
+        self._teacher_use_disable_adapter = kwargs.pop('teacher_use_disable_adapter', False)
+
+    def _has_teacher_explicit(self) -> bool:
+        return (getattr(self, '_teacher_model', None) is not None
+                or getattr(self, 'teacher_model_server', None) is not None
+                or getattr(self, '_teacher_use_disable_adapter', False))
+
+    def _setup_teacher(self) -> None:
+        """Resolve the teacher mode and prepare the local model / API client.
+
+        Sets ``use_teacher_api`` / ``_is_self_distillation`` / ``_has_teacher`` /
+        ``teacher_model`` / ``teacher_client`` / ``is_teacher_ds3``. Must be called after
+        ``super().__init__`` (needs ``self.accelerator``). No-op teacher branches leave
+        ``teacher_model = None`` (API / self-distillation reuse the student weights or server).
+        """
+        teacher_model = getattr(self, '_teacher_model', None)
+        teacher_model_server = getattr(self, 'teacher_model_server', None)
+        self.use_teacher_api = teacher_model_server is not None
+        self._teacher_use_disable_adapter = getattr(self, '_teacher_use_disable_adapter', False)
+        self._is_self_distillation = (teacher_model is None and teacher_model_server is None)
+        explicit = self._has_teacher_explicit()
+        # Dynamic OPD-RL capability (no explicit teacher): student-as-teacher OPSD when a batch
+        # has ``teacher_prompt``; plain reward GRPO skips teacher forwards when OPSD is absent.
+        self._is_dynamic_self_distillation = resolve_dynamic_opd_self_distillation(
+            has_teacher_explicit=explicit,
+            is_self_distillation=self._is_self_distillation,
+        )
+        self._has_teacher = explicit or self._is_dynamic_self_distillation
+
+        self.teacher_clients: List[VLLMInferClient] = []
+        self.teacher_configs: List[TeacherServerConfig] = []
+        if self.use_teacher_api:
+            # Parse teacher config (single URL -> list of 1; JSON -> list of N).
+            self.teacher_configs = parse_teacher_model_server(teacher_model_server)
+            if self.accelerator.is_main_process:
+                self.teacher_clients = [VLLMInferClient(base_urls=[cfg.url]) for cfg in self.teacher_configs]
+
+        self.teacher_ds3_gather_for_generation = getattr(self.args, 'ds3_gather_for_generation', False)
+        self.is_teacher_ds3 = None
+        self.teacher_model = None
+        if teacher_model is not None:
+            teacher_deepspeed_config = getattr(self, '_teacher_deepspeed_config', None)
+            if self.is_deepspeed_enabled:
+                if teacher_deepspeed_config is not None:
+                    self.is_teacher_ds3 = teacher_deepspeed_config.get('zero_optimization', {}).get('stage') == 3
+                    if not self.is_teacher_ds3:
+                        self.teacher_ds3_gather_for_generation = False
+                    self.teacher_model = prepare_deepspeed(
+                        teacher_model,
+                        self.accelerator,
+                        deepspeed_config=teacher_deepspeed_config,
+                        training_args=self.args)
+                else:
+                    self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            elif self.is_fsdp_enabled:
+                self.teacher_model = prepare_fsdp(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            self.teacher_model.eval()
+            if self.args.offload_teacher_model:
+                self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+
+    @contextmanager
+    def load_teacher_model_context(self):
+        """Load the local teacher to GPU for a forward and offload afterwards (when offloading is on)."""
+        if not self.args.offload_teacher_model or self.teacher_model is None:
+            yield
+            return
+        self.load_model(self.accelerator.unwrap_model(self.teacher_model))
+        try:
+            yield
+        finally:
+            self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+
+    def _gather_teacher_requests(self, requests: List[Any]) -> Dict[str, Any]:
+        """Phase 1 (all ranks, collective): gather this teacher's requests across DP.
+
+        Returns a handle carrying the flattened global requests (for infer on the main process)
+        and the per-rank counts + this rank's local count (for the later slice). The slice offset
+        is the prefix sum of preceding ranks' counts, not ``rank * n_local``: under multi-teacher
+        routing each rank's routed subset may differ in length, so equal-length slicing misaligns.
+        """
+        n_local = len(requests)
+        all_requests = gather_object(requests)
+        all_counts = gather_object([n_local])  # per-rank counts in rank order
+        return {'all_requests': all_requests, 'all_counts': all_counts, 'n_local': n_local}
+
+    def _infer_teacher_requests(self, handle: Dict[str, Any], topk: int, teacher_client: Optional[Any] = None):
+        """Phase 2 (main process only, no collective): run the teacher HTTP infer.
+
+        Safe to call concurrently across teachers (distinct clients, no collective inside).
+        ``topk == 0`` -> the sampled token's logp (OPD-RL); ``topk > 0`` -> top-k (GKD).
+        """
+        if not handle['all_requests']:  # no sample routed to this teacher: skip the empty HTTP call
+            return []
+        client = teacher_client if teacher_client is not None else self.teacher_clients[0]
+        request_config = RequestConfig(prompt_logprobs=topk, max_tokens=1, temperature=0.0)
+        responses = client.infer(handle['all_requests'], request_config=request_config, use_tqdm=False)
+        return [parse_prompt_logprobs(r, topk=topk) for r in responses]
+
+    def _scatter_teacher_parsed(self, handle: Dict[str, Any], parsed_global):
+        """Phase 3 (all ranks, collective): broadcast the parsed result and slice this rank's part."""
+        container = [parsed_global]
+        broadcast_object_list(container, from_process=0)
+        parsed_global = container[0]
+        rank = self.accelerator.process_index
+        offset = sum(handle['all_counts'][:rank])
+        return parsed_global[offset:offset + handle['n_local']]
+
+    def _fetch_teacher_logprobs(self, requests: List[Any], topk: int, teacher_client: Optional[Any] = None):
+        """Combined gather→infer→broadcast for a single teacher (serial); returns this rank's slice."""
+        handle = self._gather_teacher_requests(requests)
+        parsed_global = self._infer_teacher_requests(handle, topk, teacher_client) \
+            if self.accelerator.is_main_process else None
+        return self._scatter_teacher_parsed(handle, parsed_global)
+
+    def split_by_mini_batches(self, samples: List[OnPolicySample]) -> List[List[OnPolicySample]]:
         """Split inputs into mini-batches based on steps_per_generation.
 
         For sequence_parallel_size > 1, gathers inputs across SP/RP groups first,
@@ -138,25 +315,25 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         if self.template.sequence_parallel_size == 1:
             mode: str = 'train' if self.model.training else 'eval'
             spg: int = self.args.steps_per_generation if mode == 'train' else 1
-            return self._split_data_by_steps(inputs, spg)
+            return self._split_data_by_steps(samples, spg)
         else:
             output = [None] * sequence_parallel.sp_world_size
-            dist.all_gather_object(output, inputs, group=sequence_parallel.sp_group)
+            dist.all_gather_object(output, samples, group=sequence_parallel.sp_group)
             if sequence_parallel.rp_world_size > 1:
                 output_rp = [None] * sequence_parallel.rp_world_size
-                output = [p for sublist in output for p in sublist]
+                samples = [p for sublist in output for p in sublist]
                 dist.all_gather_object(output_rp, output, group=sequence_parallel.rp_group)
                 output = output_rp
-            inputs = [p for sublist in output for p in sublist]
+            samples = [p for sublist in output for p in sublist]
 
             mode = 'train' if self.model.training else 'eval'
             if mode == 'eval':
-                inputs = inputs[:self.args.per_device_eval_batch_size]
+                samples = samples[:self.args.per_device_eval_batch_size]
                 spg = 1
             else:
                 spg = self.args.steps_per_generation * sequence_parallel.world_size
 
-            spg_chunks = self._split_data_by_steps(inputs, spg)
+            spg_chunks = self._split_data_by_steps(samples, spg)
             return to_device(spg_chunks, device=self.accelerator.device)
 
     def _prepare_rollout_params(self):
@@ -183,6 +360,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            min_p=args.min_p,
             repetition_penalty=args.repetition_penalty,
             stop=args.stop_words,
             return_details=True,
@@ -203,31 +381,50 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         self.vllm_use_async_engine = False
         self.vllm_version_ge_0_10_2 = check_vllm_version_ge('0.10.2')
         self.disable_rollout_importance_sampling = not self.vllm_version_ge_0_10_2
+        # for multi-turn server, maybe the num of rollout outputs is not equal to the num of rollout inputs
+        self.dynamic_num_samples = False
+        self.base_sync_done = False
+        self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
+        self._cached_vllm_param_names = None
         # split model parameters into batches for synchronized weight transfer / ref sync
         if not args.use_vllm:
+            infer_template = copy(self.template)
+            infer_template.padding_free = False
+            infer_template.sequence_parallel_size = 1
+            infer_template.remove_unused_columns = True
+            self.engine = TransformersEngine(self.model, template=infer_template, max_batch_size=0)
             return
 
         if not is_vllm_available():
             raise ImportError('vLLM is not available and `use_vllm` is set to True. '
                               'Please install vLLM with `pip install vllm -U` to use it.')
 
+        if is_torch_npu_available():
+            from swift.model.npu_patch.vllm_ascend import validate_vllm_ascend_lora_training
+            validate_vllm_ascend_lora_training(self.model, args)
+
         if not self.vllm_version_ge_0_10_2 and getattr(self.args, 'rollout_importance_sampling_mode', None) is not None:
             raise ValueError('rollout_importance_sampling_mode is not supported in vLLM version < 0.10.2, '
                              'please update vLLM to 0.10.2 or later.')
+
+        explicit_use_gym_env = getattr(args, 'use_gym_env', None)
+        if explicit_use_gym_env is not None:
+            self.use_gym_env = bool(explicit_use_gym_env)
 
         if self.vllm_mode == 'server':
             if self.accelerator.is_main_process:
                 self.vllm_client.get_engine_type()
                 self.vllm_client.reset_mm_cache()
                 vllm_use_async_engine = [self.vllm_client.use_async_engine]
-                use_gym_env = [self.vllm_client.use_gym_env]
                 enable_multi_turn = [self.vllm_client.enable_multi_turn]
                 enable_lora = [self.vllm_client.enable_lora]
+                # Only inherit use_gym_env from rollout server when the trainer hasn't set it explicitly.
+                use_gym_env = [self.vllm_client.use_gym_env] if explicit_use_gym_env is None else [self.use_gym_env]
             else:
                 vllm_use_async_engine = [False]
-                use_gym_env = [False]
                 enable_multi_turn = [self.enable_server_multi_turn]
                 enable_lora = [False]
+                use_gym_env = [self.use_gym_env]
             self.vllm_use_async_engine = broadcast_object_list(vllm_use_async_engine, from_process=0)[0]
             self.use_gym_env = broadcast_object_list(use_gym_env, from_process=0)[0]
             self.enable_server_multi_turn = broadcast_object_list(enable_multi_turn, from_process=0)[0]
@@ -244,17 +441,21 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
                 ])
             self.enable_offload = args.offload_model or args.offload_optimizer
-            context = self.offload_context if self.enable_offload else nullcontext
+            # At init (prepare_rollout, before accelerator.prepare()) an FSDP2
+            # model is still full-sized on CPU — sharding hasn't happened yet.
+            # Skip the offload context entirely: both the offload and the reload
+            # are pointless here, and reloading the full model onto a single card
+            # would OOM. train()'s accelerator.prepare() will shard and load it.
+            if self.enable_offload and not self._is_fsdp2:
+                rollout_cm = self.offload_context()
+            else:
+                rollout_cm = nullcontext()
 
-            with context():
+            with rollout_cm, self._disable_sp_context():
                 self.engine = self._prepare_vllm_engine()
                 self.engine.engine.reset_mm_cache()
                 if args.sleep_level > 0:
-                    self.engine.engine.sleep(args.sleep_level)
-        self.dynamic_num_samples = False  # grpo multi-turn
-        self.base_sync_done = False
-        self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
-        self._cached_vllm_param_names = None
+                    vllm_sleep(self.engine.engine, args.sleep_level)
 
     def _prepare_vllm_engine(self):
         """Create and configure vLLM engine for colocate mode"""
@@ -285,7 +486,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     'as vLLM currently does not support LoRA in MoE configurations. If you encounter errors, '
                     'please set vllm_enable_lora to False.')
 
-            if self.is_multimodal:
+            if model.model_meta.is_multimodal:
                 logger.warning('vLLM LoRA is enabled for a multimodal model. This may lead to unexpected issues '
                                'when applying LoRA to the ViT component, as vLLM does not yet support this setup. '
                                'If errors occur, please disable LoRA by setting vllm_enable_lora to False.')
@@ -497,10 +698,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 if not self._is_fsdp2:
                     self.model.merge_adapter()
                 cur_lora_params = get_peft_model_state_dict(self.model, state_dict)
-                cur_lora_params = {
-                    name: param.full_tensor().detach() if hasattr(param, 'full_tensor') else param.detach()
-                    for name, param in cur_lora_params.items()
-                }
+                for name, param in cur_lora_params.items():
+                    if hasattr(param, 'full_tensor'):
+                        if param.is_cpu:
+                            param = param.to(get_current_device())
+                        param = param.full_tensor()
+                    cur_lora_params[name] = param.detach()
                 lora_params.update(cur_lora_params)
                 if not self._is_fsdp2:
                     with patch_lora_unmerge(self.model):
@@ -568,15 +771,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     self.vllm_client.update_named_param(name, param)
         elif self.vllm_mode == 'colocate':
             llm_model = self.engine.inner_model
-            # Patch MoE weight_loader if needed
-            patch_vllm_moe_model_weight_loader(llm_model)
-            # Re-run process_weights_after_loading on FusedMoE layers so
-            # the kernel-format layout is rebuilt after the in-place reload
-            # (workaround for vLLM issue #42821).
-            try:
-                llm_model.load_weights(state_dict.items())
-            finally:
-                finish_vllm_weight_reload(llm_model)
+            llm_model.load_weights(state_dict.items())
         del state_dict
 
     def _fix_param_name_to_vllm(self, name: str, extra_prefixes: Optional[List[str]] = None) -> str:
@@ -601,6 +796,10 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             Processed state dict ready for vLLM
         """
         processed = {}
+        expand_fused_moe_expert_weight = None
+        if is_torch_npu_available():
+            from swift.model.npu_patch.vllm_ascend_moe import expand_fused_moe_expert_weight_for_vllm_ascend
+            expand_fused_moe_expert_weight = expand_fused_moe_expert_weight_for_vllm_ascend
         for name, param in state_dict.items():
             # Clean up parameter name for PEFT models
             clean_name = name.removeprefix('base_model.model.')
@@ -626,6 +825,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 if param.is_cpu:
                     param = param.to(get_current_device())
                 param = param.full_tensor()
+
+            if expand_fused_moe_expert_weight is not None:
+                expanded_moe_weights = expand_fused_moe_expert_weight(clean_name, param)
+                if expanded_moe_weights is not None:
+                    processed.update(expanded_moe_weights)
+                    continue
 
             processed[clean_name] = param
 
@@ -747,10 +952,23 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         if parameter_group_no_lora:
             if is_peft:
                 parameter_group_no_lora = [n.replace('base_model.model.', '') for n in parameter_group_no_lora]
+            parameter_group_no_lora = set(parameter_group_no_lora)
+            if is_torch_npu_available():
+                from swift.model.npu_patch.vllm_ascend_moe import expand_fused_moe_expert_names_for_vllm_ascend
+                for name in tuple(parameter_group_no_lora):
+                    expanded_names = expand_fused_moe_expert_names_for_vllm_ascend(name)
+                    if expanded_names is not None:
+                        parameter_group_no_lora.update(expanded_names)
             state_dict = {k: v for k, v in state_dict.items() if k in parameter_group_no_lora}
 
         if is_peft:
             assert len(state_dict) > 0 and all([state.shape != torch.Size([0]) for state in state_dict.values()])
+
+        # Revert transformers runtime param names back to checkpoint names so vLLM's
+        # hf_to_vllm_mapper (built for checkpoint names) maps them correctly. Fixes
+        # online weight sync for models like gemma4_unified where runtime names differ
+        # from checkpoint names (transformers>=5 conversion mapping). No-op otherwise.
+        state_dict = revert_runtime_names_to_checkpoint(self.accelerator.unwrap_model(self.model), state_dict)
 
         return state_dict
 
@@ -767,29 +985,68 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
 
         gather_if_zero3 = get_gather_if_zero3_context(self)
 
-        for i, parameter_group in enumerate(self.parameter_groups):
-            parameter_group_no_lora = self.parameter_groups_no_lora[i]
+        ascend_reload_runner = None
+        if self.vllm_mode == 'colocate' and is_torch_npu_available():
+            from swift.model.npu_patch.vllm_ascend import get_vllm_ascend_reload_runner
+            ascend_reload_runner = get_vllm_ascend_reload_runner(self.engine)
+        if self.vllm_mode == 'colocate':
+            if ascend_reload_runner is None:
+                # Legacy vLLM-Ascend and GPU keep the existing in-place reload
+                # path. The Ascend fallback loader writes directly into the
+                # processed MoE layout and guards its redundant post-load.
+                patch_vllm_moe_model_weight_loader(self.engine.inner_model)
 
-            if not self._is_fsdp2:
-                parameters = [
-                    parameter for name, parameter in self.model.named_parameters()
-                    if not parameter_group or name in parameter_group
-                ]
-            else:
-                parameters = []
+        def iter_state_dicts():
+            for i, parameter_group in enumerate(self.parameter_groups):
+                parameter_group_no_lora = self.parameter_groups_no_lora[i]
 
-            with gather_if_zero3(parameters):
-                if should_merge:
-                    with patch_lora_merge(self.model, parameter_group):
-                        self.model.merge_adapter()
+                if not self._is_fsdp2:
+                    parameters = [
+                        parameter for name, parameter in self.model.named_parameters()
+                        if not parameter_group or name in parameter_group
+                    ]
+                else:
+                    parameters = []
 
-                try:
-                    state_dict = self._collect_state_dict_for_vllm(parameter_group, parameter_group_no_lora)
-                    self._load_state_dict_to_vllm(state_dict)
-                finally:
+                with gather_if_zero3(parameters):
                     if should_merge:
-                        with patch_lora_unmerge(self.model):
-                            self.model.unmerge_adapter()
+                        with patch_lora_merge(self.model, parameter_group):
+                            self.model.merge_adapter()
+
+                    try:
+                        yield self._collect_state_dict_for_vllm(parameter_group, parameter_group_no_lora)
+                    finally:
+                        if should_merge:
+                            with patch_lora_unmerge(self.model):
+                                self.model.unmerge_adapter()
+
+        state_dicts = iter_state_dicts()
+        if ascend_reload_runner is not None:
+
+            def iter_weights():
+                for state_dict in state_dicts:
+                    yield from state_dict.items()
+
+            weights = iter_weights()
+            try:
+                ascend_reload_runner.reload_weights(weights_iterator=weights, is_checkpoint_format=True)
+            finally:
+                weights.close()
+                state_dicts.close()
+        else:
+            try:
+                for state_dict in state_dicts:
+                    self._load_state_dict_to_vllm(state_dict)
+            finally:
+                state_dicts.close()
+
+        # Re-run process_weights_after_loading once after ALL groups loaded
+        if self.vllm_mode == 'colocate' and ascend_reload_runner is None:
+            _model_config = self.engine.engine.model_config
+            llm_model = self.engine.inner_model
+            finish_vllm_weight_reload(llm_model, model_config=_model_config, target_device=self.accelerator.device)
+        elif self.vllm_mode == 'server' and self.accelerator.is_main_process:
+            self.vllm_client.process_weights_after_loading()
 
         if is_peft:
             self.base_sync_done = True
@@ -837,15 +1094,15 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     _mix_inplace(rp, pp)
 
     def _rollout(self,
-                 inputs: Optional[DataType],
+                 samples: List[OnPolicySample],
                  request_config: RequestConfig,
                  is_global_inputs: bool = False) -> List[RolloutOutput]:
         """Execute rollout using vLLM server or colocate mode"""
         request_config = self._get_request_config()
         if self.vllm_mode == 'server':
-            rollout_outputs = self._server_rollout(inputs, request_config, is_global_inputs)
+            rollout_outputs = self._server_rollout(samples, request_config, is_global_inputs)
         else:
-            rollout_outputs = self._colocate_rollout(inputs, request_config)
+            rollout_outputs = self._colocate_rollout(samples, request_config)
         return rollout_outputs
 
     def _get_request_config(self) -> RequestConfig:
@@ -863,260 +1120,143 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
 
         return request_config
 
-    def _set_inputs_system(self, inputs: DataType) -> DataType:
-        """Insert default system message if not present"""
-        if not self.template.template_meta.default_system:
-            return inputs
-        if all(_input['messages'][0]['role'] == 'system' for _input in inputs):
-            return inputs
-        for _input in inputs:
-            messages = _input['messages']
-            if messages[0]['role'] != 'system':
-                messages.insert(0, {'role': 'system', 'content': self.template.template_meta.default_system})
-        return inputs
-
     def _infer_single_or_multi_turn(self,
-                                    inputs: DataType,
+                                    samples: List[OnPolicySample],
                                     request_config: RequestConfig,
-                                    is_global_inputs: bool = False) -> List[DataType]:
-        """Run inference for single-turn or multi-turn dialogue"""
-        inputs = self._set_inputs_system(inputs)
-        rollout_outputs: List[RolloutOutput] = self._rollout(inputs, request_config, is_global_inputs)
-
+                                    is_global_inputs: bool = False) -> List[OnPolicySample]:
         if not self.multi_turn_scheduler or self.enable_server_multi_turn:
-            return self._postprocess_rollout_outputs(inputs, rollout_outputs)
+            rollout_outputs: List[RolloutOutput] = self._rollout(samples, request_config, is_global_inputs)
+            return self._postprocess_rollout_outputs(samples, rollout_outputs)
 
-        return self._colocate_multi_turn_infer(inputs, rollout_outputs, request_config)
+        # Multi-turn: call on_trajectory_start BEFORE first turn generation
+        # so the model sees the actual environment question, not the placeholder.
+        requests = self.samples2requests(samples)
+        invoke_async_hook(self.multi_turn_scheduler.on_trajectory_start(requests))
 
-    def _colocate_multi_turn_infer(self, inputs: DataType, first_turn_rollout_outputs: List[RolloutOutput],
-                                   request_config: RequestConfig) -> List[RolloutOutput]:
-        """
-        Handles multi-turn inference under colocate mode.
+        # Update inputs with actual messages from requests (e.g. env question)
+        for req, sample in zip(requests, samples):
+            sample.messages = req.messages
 
-        This method iteratively rolls out turns until all dialogues are finished
-        according to the multi_turn_scheduler.
-        """
-        args = self.args
-        orig_size = len(inputs)
-        # Preallocate to preserve order
-        rollout_outputs: List[RolloutOutput] = [None] * orig_size
-        rollout_infos = [{} for _ in range(orig_size)]
-        response_token_ids = [[] for _ in range(orig_size)]
-        response_loss_mask = [[] for _ in range(orig_size)]
-        rollout_logprobs = [[] for _ in range(orig_size)]
-        is_continuations = [False] * orig_size
-        # Attach index to inputs for tracking
-        requests = self.inputs2requests(inputs)
-        index_to_infer = list(range(orig_size))
-        current_turn = 1
-        outputs = first_turn_rollout_outputs
-        while True:
-            has_local_data = bool(len(index_to_infer) > 0)
-            has_global_data = gather_object([has_local_data])
-            if not any(has_global_data):
-                break
-            assert len(index_to_infer) == len(outputs)
-            for index, output in zip(index_to_infer, outputs):
-                messages = requests[index].messages
-                if messages[-1]['content'] is None:
-                    # for continuation, we add dummy response, remove here
-                    remove_response(messages)
-                # Get model response
-                response = output.response
-                response_choice = response.choices[0]
-                # Update conversation history
-                completion = response_choice.message.content
-                is_continuation = is_continuations[index] = False
-                if messages[-1]['role'] == 'assistant':
-                    messages[-1]['content'] += completion
-                    is_continuation = is_continuations[index] = True
-                else:
-                    messages.append({'role': 'assistant', 'content': completion})
+        # Generate first turn with actual questions
+        first_turn_rollout_outputs: List[RolloutOutput] = self._rollout(samples, request_config, is_global_inputs)
 
-            current_requests = [requests[index] for index in index_to_infer]
-            # Determine which dialogues are finished
-            should_stops = [
-                self.multi_turn_scheduler.check_finished(req, output.response.choices[0], current_turn)
-                for req, output in zip(current_requests, outputs)
-            ]
+        return self._colocate_multi_turn_infer(samples, first_turn_rollout_outputs, request_config, requests)
 
-            # Prepare pending inputs for next turn
-            next_turn_index_to_infer = []
-            for stop, index, output in zip(should_stops, index_to_infer, outputs):
-                if args.max_turns:
-                    stop = stop or (current_turn >= args.max_turns)
-                if stop:
-                    # For stopped dialogues, collect final turn's data
-                    is_continuation = is_continuations[index]
-                    response_choice = output.response.choices[0]
-                    current_logprobs = self._extract_logprobs_from_choice(response_choice)
-                    final_token_ids = response_choice.token_ids
+    def _colocate_multi_turn_infer(self,
+                                   samples: List[OnPolicySample],
+                                   first_turn_rollout_outputs: List[RolloutOutput],
+                                   request_config: RequestConfig,
+                                   requests: Optional[List] = None) -> List[OnPolicySample]:
+        if requests is None:
+            requests = self.samples2requests(samples)
+        rollout_outputs = run_multi_turn(
+            requests=requests,
+            first_turn_outputs=first_turn_rollout_outputs,
+            scheduler=self.multi_turn_scheduler,
+            rollout_fn=lambda reqs, cfg: self._rollout(reqs, cfg),
+            request_config=request_config,
+            max_turns=self.args.max_turns,
+            gather_fn=gather_object,
+        )
+        return self._postprocess_rollout_outputs(samples, rollout_outputs)
 
-                    if is_continuation and response_token_ids[index]:
-                        # For continuation, extend the last turn's data
-                        response_token_ids[index][-1].extend(final_token_ids)
-                        if response_loss_mask[index]:
-                            response_loss_mask[index][-1].extend([1] * len(final_token_ids))
-                        if rollout_logprobs[index] and current_logprobs:
-                            rollout_logprobs[index][-1].extend(current_logprobs)
-                    elif not response_token_ids[index]:
-                        # First turn stopped immediately - need to initialize with final response data
-                        if final_token_ids:
-                            response_token_ids[index] = [list(final_token_ids)]
-                            response_loss_mask[index] = [[1] * len(final_token_ids)]
-                        if current_logprobs:
-                            rollout_logprobs[index] = [current_logprobs]
-                    else:
-                        # Not continuation but has previous data - append as new turn
-                        if final_token_ids:
-                            response_token_ids[index].append(list(final_token_ids))
-                            response_loss_mask[index].append([1] * len(final_token_ids))
-                        if current_logprobs:
-                            rollout_logprobs[index].append(current_logprobs)
+    def _generate_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        # add prompt ids and system prompts
+        samples = self._preprocess_inputs(samples)
 
-                    # Validate rollout_logprobs completeness: if logprobs are incomplete (missing for some turns),
-                    # clear them to disable rollout importance sampling correction (which requires complete logprobs)
-                    # Note: rollout_logprobs should match the number of loss_mask=1 tokens, not total response tokens
-                    # because completion_mask in grpo_trainer is based on labels != -100, which corresponds to loss_mask=1 # noqa
-                    final_rollout_logprobs = rollout_logprobs[index]
-                    if rollout_logprobs[index]:
-                        total_logprob_count = sum(len(turn_lps) for turn_lps in rollout_logprobs[index])
-                        if response_loss_mask[index]:
-                            # Check if the number of logprobs matches the number of loss_mask=1 tokens
-                            total_loss_mask_1_count = sum(sum(mask) for mask in response_loss_mask[index])
-                            if total_loss_mask_1_count != total_logprob_count:
-                                # Incomplete logprobs, clear them
-                                final_rollout_logprobs = []
-                        else:
-                            # No loss_mask, fall back to checking against response_token_ids
-                            if response_token_ids[index]:
-                                total_token_count = sum(len(turn_ids) for turn_ids in response_token_ids[index])
-                                if total_token_count != total_logprob_count:
-                                    final_rollout_logprobs = []
-                            else:
-                                final_rollout_logprobs = []
+        mode = 'train' if self.model.training else 'eval'
+        if self.use_fast_infer:
+            samples = self._fast_infer(samples)
+        else:
+            with unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+            ), self.template.generate_context(), self.multi_turn_completion_length_context():
+                samples = self._infer_single_or_multi_turn(samples, self.request_config)
+                if mode == 'train':
+                    # In training mode, ensure the model is returned to train() mode after inference
+                    # This is necessary as transformers engines set the model to eval mode during generation
+                    self.model.train()
 
-                    rollout_outputs[index] = RolloutOutput(
-                        response=output.response,
-                        messages=requests[index].messages,
-                        response_token_ids=response_token_ids[index],
-                        response_loss_mask=response_loss_mask[index],
-                        rollout_infos={
-                            **rollout_infos[index], 'num_turns': current_turn
-                        },
-                        rollout_logprobs=final_rollout_logprobs)
-                    continue
-                is_continuation = is_continuations[index]
-                step_result = self.multi_turn_scheduler.step(requests[index], output.response.choices[0], current_turn)
-                current_request: RolloutInferRequest = step_result['infer_request']
-                # Track response tokens and masks
-                return_token_id = False
-                if 'response_token_ids' in step_result:
-                    if is_continuation and response_token_ids[index]:
-                        response_token_ids[index][-1].extend(step_result['response_token_ids'])
-                    else:
-                        response_token_ids[index].append(step_result['response_token_ids'])
-                    return_token_id = True
-                if 'response_loss_mask' in step_result:
-                    assert return_token_id, 'You must return response_token_ids with response_loss_mask return'
-                    assert len(step_result['response_loss_mask']) == len(step_result['response_token_ids']), \
-                        'response_loss_mask must have the same length as response_token_ids'
-                    if is_continuation and response_loss_mask[index]:
-                        response_loss_mask[index][-1].extend(step_result['response_loss_mask'])
-                    else:
-                        response_loss_mask[index].append(step_result['response_loss_mask'])
+        return samples
 
-                if 'rollout_infos' in step_result:
-                    # Always overwrite the rollout info for this step.
-                    # If you need to keep all step-wise details, switch to append or merge instead.
-                    rollout_infos[index].update(step_result['rollout_infos'])
-
-                # Track rollout_logprobs for rollout importance sampling correction
-                # Prefer step's returned logprobs (which may be modified/truncated) over raw response_choice logprobs
-                if 'rollout_logprobs' in step_result and step_result['rollout_logprobs']:
-                    current_logprobs = step_result['rollout_logprobs']
-                else:
-                    current_logprobs = self._extract_logprobs_from_choice(output.response.choices[0])
-                if current_logprobs:
-                    if is_continuation and rollout_logprobs[index]:
-                        rollout_logprobs[index][-1].extend(current_logprobs)
-                    else:
-                        rollout_logprobs[index].append(current_logprobs)
-
-                requests[index] = current_request
-                next_turn_index_to_infer.append(index)
-            current_turn += 1
-            infer_requests = [requests[index] for index in next_turn_index_to_infer]
-            # Rollout for the next turn
-            outputs = self._rollout(infer_requests if has_local_data else [], request_config)
-            index_to_infer = next_turn_index_to_infer
-
-        assert all(o is not None for o in rollout_outputs)
-        return self._postprocess_rollout_outputs(inputs, rollout_outputs)
-
-    def _fast_infer(self, inputs: DataType) -> DataType:
+    def _fast_infer(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
         """Efficient inference with vLLM colocate mode support"""
         args = self.args
         assert isinstance(args, RolloutTrainerArgumentsMixin)
 
-        if self.vllm_mode == 'colocate' and args.sleep_level > 0:
-            if self.engine.inner_model_executor.is_sleeping:
-                wake_up_params = inspect.signature(self.engine.engine.wake_up).parameters
-                kwargs = {'tags': ['weights']} if 'tags' in wake_up_params else {}
-                aggressive_empty_cache()
-                self.engine.engine.wake_up(**kwargs)
+        if args.async_generate:
+            # Check every rank before updating weights or starting another rollout.
+            self._wait_queue()
 
-        if self.state.global_step != self._last_loaded_step or args.sleep_level == 2:
-            self._move_model_to_vllm()
+        needs_weight_sync = self.state.global_step != self._last_loaded_step or args.sleep_level == 2
+        colocate_sleeping = (
+            self.vllm_mode == 'colocate' and args.sleep_level > 0 and self.engine.inner_model_executor.is_sleeping)
+        wake_up_supports_tags = (
+            colocate_sleeping and 'tags' in inspect.signature(self.engine.engine.wake_up).parameters)
+
+        if colocate_sleeping and needs_weight_sync:
+            kwargs = {'tags': ['weights']} if wake_up_supports_tags else {}
+            aggressive_empty_cache()
+            self.engine.engine.wake_up(**kwargs)
+
+        if needs_weight_sync:
+            self._move_model_to_vllm(skip_async_check=True)
             self._last_loaded_step = self.state.global_step
 
         context = self.offload_context if self.enable_offload else nullcontext
         with context():
+            rollout_failed = False
+            try:
+                if colocate_sleeping and self.engine.inner_model_executor.is_sleeping:
+                    aggressive_empty_cache()
+                    set_expandable_segments(False)
+                    tags = ['kv_cache']
+                    if wake_up_supports_tags and not needs_weight_sync:
+                        tags.insert(0, 'weights')
+                    kwargs = {'tags': tags} if wake_up_supports_tags else {}
+                    self.engine.engine.wake_up(**kwargs)
 
-            if (self.vllm_mode == 'colocate' and self.engine.inner_model_executor.is_sleeping
-                    and 'tags' in inspect.signature(self.engine.engine.wake_up).parameters):
-                aggressive_empty_cache()
-                set_expandable_segments(False)
-                self.engine.engine.wake_up(tags=['kv_cache'])
+                if args.async_generate:
+                    data_cache = self._queue.get_nowait()
+                    all_inputs = gather_object(samples)
+                    self.async_generate_rollout(all_inputs)
 
-            if hasattr(self, 'async_generate') and self.async_generate:
-                all_inputs = gather_object(inputs)
-                self.async_generate_rollout(all_inputs)
+                    all_outputs = gather_object(data_cache.results)
 
-                data_cache = self._queue.get()
-                all_outputs = gather_object(data_cache.results)
+                    per_device_datasize = len(all_outputs) // self.accelerator.num_processes
+                    process_slice = slice(
+                        self.accelerator.process_index * per_device_datasize,
+                        (self.accelerator.process_index + 1) * per_device_datasize,
+                    )
+                    outputs = all_outputs[process_slice]
 
-                per_device_datasize = len(all_outputs) // self.accelerator.num_processes
-                process_slice = slice(
-                    self.accelerator.process_index * per_device_datasize,
-                    (self.accelerator.process_index + 1) * per_device_datasize,
-                )
-                outputs = all_outputs[process_slice]
-
-            else:
-                with self.multi_turn_completion_length_context():
-                    outputs = self._infer_single_or_multi_turn(inputs, self.request_config)
-
-            if self.vllm_mode == 'colocate' and args.sleep_level > 0:
-                self.engine.engine.reset_prefix_cache()
-                self.engine.engine.sleep(level=args.sleep_level)
-                aggressive_empty_cache()
-                set_expandable_segments(True)
+                else:
+                    with self.multi_turn_completion_length_context():
+                        outputs = self._infer_single_or_multi_turn(samples, self.request_config)
+            except BaseException:
+                rollout_failed = True
+                raise
+            finally:
+                # vLLM must release its memory before offload_context reloads the trainer model.
+                # Keep this cleanup on the exception path as well to avoid masking rollout failures with an OOM.
+                if self.vllm_mode == 'colocate' and args.sleep_level > 0:
+                    sleep_vllm_engine(self.engine.engine, args.sleep_level, suppress_errors=rollout_failed)
         return outputs
 
-    def _preprocess_inputs(self, inputs: DataType) -> DataType:
-        """Preprocess inputs before inference"""
-        processed_inputs = self._add_prompt_id_to_inputs(inputs)
-        for input_item in processed_inputs:
-            remove_response(input_item['messages'])
-        return processed_inputs
+    def _preprocess_inputs(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Preprocess samples before inference"""
+        samples = self._set_inputs_system(samples)
+        samples = self._add_prompt_id_to_inputs(samples)
+        for s in samples:
+            remove_response(s.messages)
+        return samples
 
-    def _add_prompt_id_to_inputs(self, inputs: DataType) -> DataType:
-        """Add unique prompt_id and request_id to each input"""
-        if not inputs:
-            return inputs
+    def _add_prompt_id_to_inputs(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Add unique prompt_id and request_id to each sample"""
+        if not samples:
+            return samples
 
-        all_messages = gather_object([inp['messages'] for inp in inputs])
+        all_messages = gather_object([s.messages for s in samples])
         messages_to_prompt_id = {}
         prompt_id_counter = 0
 
@@ -1126,17 +1266,16 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 messages_to_prompt_id[key] = f'prompt_{prompt_id_counter}'
                 prompt_id_counter += 1
 
-        for input_item in inputs:
-            messages = input_item.get('messages')
-            input_item['prompt_id'] = messages_to_prompt_id[json.dumps(messages)]
-            input_item['request_id'] = f'chatcmpl-{str(uuid.uuid4().hex)}'
+        for s in samples:
+            s.prompt_id = messages_to_prompt_id[json.dumps(s.messages)]
+            s.request_id = f'chatcmpl-{str(uuid.uuid4().hex)}'
 
-        return inputs
+        return samples
 
-    def _server_rollout(self, inputs: DataType, request_config: RequestConfig,
+    def _server_rollout(self, samples: List[OnPolicySample], request_config: RequestConfig,
                         is_global_inputs: bool) -> List[RolloutOutput]:
         """Perform rollout inference using vLLM server mode"""
-        infer_requests = self.inputs2requests(inputs)
+        infer_requests = self.samples2requests(samples)
 
         if is_global_inputs:
             per_device_size = len(infer_requests) // self.accelerator.num_processes
@@ -1163,6 +1302,10 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             outputs_count = gather_object(outputs_count)[0]
             if outputs_count != len(all_requests):
                 self.dynamic_num_samples = True
+                logger.warning(
+                    'Detected a multi-turn scheduler that splits one trajectory into multiple training samples '
+                    'This code path is scheduled for removal in future swift — please migrate '
+                    'to a single-trajectory scheduler (e.g. return one sample per request from `run`).')
                 if self.dynamic_sample:
                     logger.warning('Mismatch between returned samples and requests detected.')
                 if self.template.padding_free:
@@ -1185,11 +1328,15 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
 
         return outputs
 
-    def _colocate_rollout(self, inputs: DataType, request_config: RequestConfig) -> List[RolloutOutput]:
+    def _colocate_rollout(self, samples: List[OnPolicySample], request_config: RequestConfig) -> List[RolloutOutput]:
         """Perform co-located rollout inference with TransformersEngine or vLLMEngine"""
+        # Convert samples to RolloutInferRequest at the engine boundary.
+        # Use samples2requests so include_extra (multi_turn_scheduler / vllm_server_pass_dataset)
+        # is honored consistently with the server path.
+        requests = self.samples2requests(samples)
         if self.vllm_tensor_parallel_size > 1:
             local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
-            local_input_length = len(inputs)
+            local_input_length = len(samples)
             all_input_lengths = [None] * self.vllm_tensor_parallel_size
             torch.distributed.all_gather_object(all_input_lengths, local_input_length, group=self.tp_group)
 
@@ -1197,10 +1344,10 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             end_idx = start_idx + all_input_lengths[local_rank_in_group]
 
             gathered_inputs = [None for _ in range(self.vllm_tensor_parallel_size)]
-            torch.distributed.all_gather_object(gathered_inputs, inputs, group=self.tp_group)
-            inputs = [p for sublist in gathered_inputs for p in sublist]
+            torch.distributed.all_gather_object(gathered_inputs, requests, group=self.tp_group)
+            requests = [p for sublist in gathered_inputs for p in sublist]
 
-        outputs: List[RolloutOutput] = self._engine_infer(infer_requests=inputs, request_config=request_config)
+        outputs: List[RolloutOutput] = self._engine_infer(infer_requests=requests, request_config=request_config)
 
         if self.vllm_tensor_parallel_size > 1:
             outputs = outputs[start_idx:end_idx]
@@ -1244,95 +1391,73 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             return [item['logprob'] for item in response_choice.logprobs['content']]
         return []
 
-    def _postprocess_rollout_outputs(self, inputs: DataType, outputs: List[RolloutOutput]) -> DataType:
-        """Postprocess rollout outputs by merging them back into inputs"""
+    def _postprocess_rollout_outputs(self, samples: List[OnPolicySample],
+                                     outputs: List[RolloutOutput]) -> List[OnPolicySample]:
+        """Merge rollout outputs back onto samples (per-sample mutation in apply_rollout_output).
 
-        def merge_output_input_data(input_data: Dict[str, Union[torch.Tensor, Any]], output: RolloutOutput):
-            response = output.response
-            choice = response.choices[0]
-
-            if output.messages:
-                input_data['messages'] = output.messages
-            else:
-                messages = input_data['messages']
-                remove_response(messages)
-                messages.append({'role': 'assistant', 'content': choice.message.content})
-
-            if output.response_token_ids:
-                input_data['response_token_ids'] = output.response_token_ids
-                if output.response_loss_mask:
-                    input_data['response_loss_mask'] = output.response_loss_mask
-            else:
-                if not self.multi_turn_scheduler:
-                    input_data['response_token_ids'] = output.response.choices[0].token_ids
-
-            if output.rollout_infos:
-                input_data['rollout_infos'] = output.rollout_infos
-
-            # Extract rollout logprobs for importance sampling if available
-            # Keep the same structure as response_token_ids (List[List[float]] for multi-turn)
-            if output.rollout_logprobs:
-                # Multi-turn scenario: preserve the nested structure to match response_token_ids
-                input_data['rollout_logprobs'] = output.rollout_logprobs
-            elif choice.logprobs is not None:
-                # Single-turn scenario: extract from response and wrap in list for consistency
-                # logprobs format: {'content': [{'token': ..., 'logprob': ..., 'bytes': ...}, ...]}
-                if 'content' in choice.logprobs:
-                    rollout_logprobs = [item['logprob'] for item in choice.logprobs['content']]
-                    input_data['rollout_logprobs'] = [rollout_logprobs]
-
-            input_data['finish_reason'] = choice.finish_reason
-            input_data['is_truncated'] = choice.finish_reason == 'length'
-            input_data['add_eos'] = False
-            if output.rollout_infos:
-                multi_modal_keys = ['images', 'videos', 'audios']
-                for key in multi_modal_keys:
-                    if key in output.rollout_infos:
-                        input_data[key] = output.rollout_infos[key]
-                        logger.info_once(f'Overriding multi-modal data from rollout_infos for key: {key}')
-
-            return input_data
-
+        Two paths:
+        - default: outputs are 1:1 aligned with local samples (single-turn colocate, server
+          single-trajectory). Use cheap zip — no cross-rank gather.
+        - dynamic_num_samples: a scheduler may split one trajectory into multiple training
+          samples, so outputs.id must be looked up against the global samples by request_id.
+        """
         if not self.dynamic_num_samples:
             if self.async_generate and not outputs:
                 return outputs
-            assert len(inputs) == len(outputs)
-            return [
-                merge_output_input_data(deepcopy(input_data), output) for input_data, output in zip(inputs, outputs)
-            ]
+            assert len(samples) == len(outputs), (f'samples ({len(samples)}) and outputs ({len(outputs)}) mismatch')
+            results = []
+            for sample, output in zip(samples, outputs):
+                sample = deepcopy(sample)
+                sample.apply_rollout_output(rollout_output=output)
+                results.append(sample)
+            return results
 
-        global_inputs = gather_object(inputs)
+        global_samples = gather_object(samples)
+        id2sample = {}
+        for sample in global_samples:
+            if sample.request_id not in id2sample:
+                id2sample[sample.request_id] = sample
         results = []
-        id2inputs = {}
-        for input_data in global_inputs:
-            request_id = input_data['request_id']
-            if request_id not in id2inputs:
-                id2inputs[request_id] = deepcopy(input_data)
         for output in outputs:
             request_id = output.response.id
-            assert request_id in id2inputs, f'Request ID {request_id} not found in inputs'
-            input_data = deepcopy(id2inputs[request_id])
-            results.append(merge_output_input_data(input_data, output))
-
+            assert request_id in id2sample, f'Request ID {request_id} not found in inputs'
+            sample = deepcopy(id2sample[request_id])
+            sample.apply_rollout_output(rollout_output=output)
+            results.append(sample)
         return results
 
     @torch.no_grad()
-    def offload_model(self, model):
+    def offload_model(self, model) -> bool:
+        """Offload model tensors to CPU and report whether anything moved."""
         # FSDP2: simple .cpu() is sufficient
         if self._is_fsdp2:
-            model.cpu()
-            torch.cuda.empty_cache()
-            return
+            moved = any(param.device.type != 'cpu' for param in model.parameters())
+            if not moved:
+                moved = any(buf is not None and buf.device.type != 'cpu' for buf in model.buffers())
+            if moved:
+                model.cpu()
+                torch.cuda.empty_cache()
+            return moved
 
-        # Default: iterate over parameters
+        # Default: iterate over parameters AND buffers.
+        moved = False
         for param in model.parameters():
             # After DeepSpeed distributed loading: param.data is empty and weights cannot be off-loaded.
             # The real weights are stored in ds_tensor.
             if is_deepspeed_enabled() and hasattr(param, 'ds_tensor'):
-                param.ds_tensor.data = param.ds_tensor.data.to('cpu', non_blocking=True)
+                tensor = param.ds_tensor
             else:
-                param.data = param.data.to(torch.device('cpu'), non_blocking=True)
-        torch.cuda.empty_cache()
+                tensor = param
+            if tensor.device.type != 'cpu':
+                tensor.data = tensor.data.to(torch.device('cpu'), non_blocking=True)
+                moved = True
+        for buf in model.buffers():
+            if buf is not None and buf.device.type != 'cpu':
+                buf.data = buf.data.to(torch.device('cpu'), non_blocking=True)
+                moved = True
+        if moved:
+            torch.cuda.empty_cache()
+        return moved
 
     @torch.no_grad()
     def load_model(self, model):
@@ -1343,13 +1468,16 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             model.to(device)
             return
 
-        # Default: iterate over parameters
+        # Default: iterate over parameters AND buffers
         for param in model.parameters():
             # Reverse logic of off-loading: move weights back to target device
             if is_deepspeed_enabled() and hasattr(param, 'ds_tensor'):
                 param.ds_tensor.data = param.ds_tensor.data.to(device, non_blocking=True)
             else:
                 param.data = param.data.to(device, non_blocking=True)
+        for buf in model.buffers():
+            if buf is not None and buf.device.type == 'cpu':
+                buf.data = buf.data.to(device, non_blocking=True)
 
     @torch.no_grad()
     def offload_optimizer(self):
@@ -1437,7 +1565,6 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
 
         self.multi_turn_scheduler = None
         if not hasattr(args, 'multi_turn_scheduler'):
-            # only GRPO support it now
             return
 
         if args.multi_turn_scheduler:
@@ -1445,8 +1572,11 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             tokenizer = getattr(self, 'processing_class', None)
             if isinstance(args.multi_turn_scheduler, str):
                 assert args.multi_turn_scheduler in multi_turns
-                multi_turn_scheduler = multi_turns[args.multi_turn_scheduler](
-                    max_turns=args.max_turns, tokenizer=tokenizer)
+                scheduler_kwargs = {'max_turns': args.max_turns, 'tokenizer': tokenizer, 'template': self.template}
+                gym_env = getattr(args, 'gym_env', None)
+                if gym_env is not None:
+                    scheduler_kwargs['gym_env'] = gym_env
+                multi_turn_scheduler = multi_turns[args.multi_turn_scheduler](**scheduler_kwargs)
                 self.multi_turn_scheduler: MultiTurnScheduler = multi_turn_scheduler
             else:
                 assert isinstance(args.multi_turn_scheduler, MultiTurnScheduler)
@@ -1488,75 +1618,28 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             self.engine.max_model_len = original_max_len
             del self.engine.set_grpo_max_model_len
 
-    def inputs2requests(self, inputs: Union[DataType, List[RolloutInferRequest]]) -> List[RolloutInferRequest]:
-        """Convert raw input data into RolloutInferRequest objects"""
+    def samples2requests(self, samples: Union[List[OnPolicySample],
+                                              List[RolloutInferRequest]]) -> List[RolloutInferRequest]:
+        """Convert OnPolicySamples into RolloutInferRequest objects.
 
-        def _process_image_data(image_data: Union[dict, str]) -> str:
-            if isinstance(image_data, dict):
-                if image_data.get('bytes'):
-                    return base64.b64encode(image_data['bytes']).decode('utf-8')
-                if image_data.get('path'):
-                    return image_data['path']
-            return image_data
-
-        if not inputs:
+        The per-sample mapping lives in ``OnPolicySample.to_infer_request``.
+        Dataset passthrough columns (``extra``) are forwarded via ``data_dict``
+        when running server mode with ``vllm_server_pass_dataset`` or under a
+        multi-turn scheduler.
+        """
+        if not samples:
             return []
 
-        args = self.args
-
-        REQUEST_METADATA_FIELDS = ['messages', 'images', 'audios', 'videos', 'tools', 'objects', 'uuid']
+        include_extra = bool(getattr(self.args, 'vllm_server_pass_dataset', False)) or bool(self.multi_turn_scheduler)
         requests_list = []
-
-        for data in inputs:
+        for data in samples:
             if isinstance(data, RolloutInferRequest):
-                request_obj = data
+                requests_list.append(data)
             else:
-                request_data = {
-                    key: data[key]
-                    for key in REQUEST_METADATA_FIELDS if key in data and data[key] is not None
-                }
-                if 'uuid' not in request_data:
-                    request_data['uuid'] = data['request_id']
-                if hasattr(args, 'vllm_server_pass_dataset') and args.vllm_server_pass_dataset:
-                    extra_fields = {
-                        k: v
-                        for k, v in data.items() if k not in REQUEST_METADATA_FIELDS and data[k] is not None
-                    }
-                    if extra_fields:
-                        request_data['data_dict'] = extra_fields
-                elif self.multi_turn_scheduler:
-                    base_data_dict = {}
-                    if 'data_dict' in data:
-                        if isinstance(data['data_dict'], dict):
-                            base_data_dict = data['data_dict']
-                        else:
-                            raise ValueError('data_dict exists but is not a dictionary')
-                    extra_data = {
-                        k: v
-                        for k, v in data.items()
-                        if k not in REQUEST_METADATA_FIELDS and k != 'data_dict' and data[k] is not None
-                    }
-                    final_data_dict = {**extra_data, **base_data_dict}
-                    request_data['data_dict'] = final_data_dict if final_data_dict else {}
-
-                if 'images' in request_data and request_data['images']:
-                    imgs = request_data['images']
-                    if not isinstance(imgs, list):
-                        imgs = [imgs]
-                    request_data['images'] = [_process_image_data(img) for img in imgs]
-
-                if 'tools' in request_data and isinstance(request_data['tools'], str):
-                    try:
-                        request_data['tools'] = json.loads(request_data['tools'])
-                    except json.JSONDecodeError:
-                        pass
-
-                request_obj = from_dict(RolloutInferRequest, request_data)
-            requests_list.append(request_obj)
-
+                requests_list.append(data.to_infer_request(include_extra=include_extra))
         return requests_list
 
-    def async_generate_rollout(self, all_inputs):
+    def async_generate_rollout(self, all_inputs: List[OnPolicySample]):
         """Async generation task for rollout"""
         current_queue = self._queue
 
@@ -1568,21 +1651,29 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 logger.error('Inference task failed: %s', str(e))
                 raise
 
-        future: Future = self.executor.submit(infer_task)
-
         def done(future):
             try:
-                result = future.result()
-                current_queue.put(DataCache(result))
-            except Exception as e:
-                logger.error('Error in async_generate_rollout callback: %s', str(e))
+                data_cache = DataCache(results=future.result())
+            except BaseException as e:
+                data_cache = DataCache(error=e)
+            current_queue.put(data_cache)
 
+        try:
+            future: Future = self.executor.submit(infer_task)
+        except BaseException as e:
+            # Submission failures must obey the same protocol on every rank.
+            future = Future()
+            future.set_exception(e)
+        # Keep the latest Future for each mode, including its exception, until replaced.
+        self._async_futures[current_queue] = future
         future.add_done_callback(done)
+        return future
 
     def _prepare_async_generate(self):
         """Initialize async generation queues and callback"""
         self.train_queue = Queue()
         self.eval_queue = Queue()
+        self._async_futures = {}
         args = self.args
 
         if args.async_generate:
@@ -1596,9 +1687,25 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         else:
             return self.train_queue
 
-    def _wait_queue(self):
-        """Wait for queue to have items"""
-        while self._queue.empty():
+    def _wait_queue(self, current_queue=None):
+        """Wait for results on every rank, propagating failures before further collectives."""
+        if current_queue is None:
+            current_queue = self._queue
+        while True:
+            # Peek without consuming: weight updates and train/eval transitions also wait here.
+            with current_queue.mutex:
+                data_cache = current_queue.queue[0] if current_queue.queue else None
+            error = data_cache.error if data_cache is not None else None
+            error_message = f'{type(error).__name__}: {error}' if error is not None else None
+            # Exchange only serializable status; the original exception stays on its owning rank.
+            statuses = gather_object([(data_cache is not None, error_message)])
+            for rank, (_, message) in enumerate(statuses):
+                if message is not None:
+                    if error is not None:
+                        raise error
+                    raise RuntimeError(f'Async rollout failed on rank {rank}: {message}')
+            if all(ready for ready, _ in statuses):
+                return
             time.sleep(0.01)
 
     def _sort_by_request_id(self, all_outputs: List[RolloutOutput]) -> List[RolloutOutput]:
@@ -1613,6 +1720,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         inputs = next(iter(dataloader))
         if self.template.truncation_strategy == 'raise':
             inputs = self.resample_encode_failed_inputs(inputs)
+        inputs = self.to_samples(inputs)
         inputs = self._preprocess_inputs(inputs)
         all_inputs = gather_object(inputs)
         if self.state.global_step != self._last_loaded_step:
@@ -1667,6 +1775,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                           inputs: Optional['DataType'] = None,
                           max_length: Optional[int] = None,
                           mode: Optional[str] = None):
+        # used for unsetting max_length
         original_max_length = template.max_length
         original_mode = template.mode
         template.max_length = max_length
@@ -1705,7 +1814,10 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             self.truncated_resample_iterator = cyclic_iter(self.get_train_dataloader())
 
     @profiling_decorator
-    def resample_encode_failed_inputs(self, inputs: DataType, max_resample_rounds: int = 10) -> DataType:
+    def resample_encode_failed_inputs(self,
+                                      inputs: DataType,
+                                      max_resample_rounds: int = 10,
+                                      strip_response=True) -> DataType:
         """
         Attempt to encode each input using the template. If encoding fails,
         resample from a backup iterator until we have enough valid samples.
@@ -1721,6 +1833,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             inputs (DataType): A list of input data samples, each containing a `messages` field.
             max_resample_rounds (int, optional): Maximum number of resample rounds.
                 Each round processes samples from pending_samples buffer. Defaults to 10.
+            strip_response (bool, optional): Whether to remove the response from the input data. Defaults to True.
 
         Returns:
             DataType: A list of successfully encoded input samples with the same length as inputs.
@@ -1731,40 +1844,10 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         assert getattr(self, 'truncated_resample_iterator',
                        None) is not None, 'Resample data iterator is not initialized'
 
-        template = self.template
-        required_count = len(inputs)
-        valid_samples = []
-
-        # Buffer for samples waiting to be validated
-        pending_samples = list(inputs)
-
-        for _ in range(max_resample_rounds + 1):
-            # Calculate how many more samples we need
-            still_needed = required_count - len(valid_samples)
-            if still_needed <= 0:
-                break
-
-            # Ensure pending_samples has enough samples to try
-            while len(pending_samples) < still_needed:
-                # Fetch a new batch of samples (uses the entire batch, not just [0])
-                pending_samples.extend(next(self.truncated_resample_iterator))
-
-            # Try to encode samples from pending_samples until we have enough valid ones
-            while pending_samples and len(valid_samples) < required_count:
-                data = pending_samples.pop(0)
-                try:
-                    remove_response(data['messages'])
-                    template.encode(data)
-                    # Encoding succeeded, add to valid samples
-                    valid_samples.append(data)
-                except Exception as e:
-                    # Encoding failed, skip this sample
-                    logger.info(f'Encoding failed for one sample; will resample. {e}')
-
-        if len(valid_samples) < required_count:
-            raise RuntimeError(
-                f'Failed to collect {required_count} valid samples after {max_resample_rounds} resample rounds. '
-                f'Only collected {len(valid_samples)} valid samples. '
-                'Consider increasing `max_length` or adjusting the `truncation_strategy`.')
-
-        return valid_samples[:required_count]
+        return resample_encode_failed_inputs(
+            self.template,
+            self.truncated_resample_iterator,
+            inputs,
+            max_resample_rounds=max_resample_rounds,
+            strip_response=strip_response,
+        )

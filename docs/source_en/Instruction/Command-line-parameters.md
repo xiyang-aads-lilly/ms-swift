@@ -121,18 +121,23 @@ The command-line arguments will be introduced in four categories: basic argument
 - 🔥padding_free: Flattens data within a batch to avoid padding, reducing GPU memory usage and accelerating training (**sequences in the same batch remain invisible to each other**). Default is `False`. Currently supported in CPT/SFT/DPO/GRPO/KTO/GKD.
   - Note: Use `padding_free` together with `--attn_impl flash_attn` and `transformers>=4.44`. See [this PR](https://github.com/huggingface/transformers/pull/31629) for details. (Same as packing.)
   - **Compared to packing, padding_free avoids extra preprocessing time, but packing offers faster training and more stable memory usage**.
-- 🔥loss_scale: Loss weight configuration for training tokens. Default is `'default'`. loss_scale includes 3 basic strategies: 'default', 'last_round', 'all', and other strategies: 'ignore_empty_think' and agent-specific ones: 'react', 'hermes', 'qwen', 'agentflan', 'alpha_umi', etc. For available options, refer to [loss_scale module](https://github.com/modelscope/ms-swift/blob/main/swift/loss_scale/mapping.py). ms-swift supports mixing basic strategies with other strategies, for example: `'default+ignore_empty_think'`, `'last_round+ignore_empty_think'`. If no basic strategy is specified, it defaults to 'default', for example: 'hermes' is equivalent to 'default+hermes'.
+- 🔥loss_scale: Loss weight configuration for training tokens. Default is `'default'`. loss_scale includes 3 basic strategies: 'default', 'last_round', 'all', and other strategies: 'ignore_empty_think', 'ignore_think_prefix', and agent-specific ones: 'react', 'hermes', 'qwen', 'agentflan', 'alpha_umi', etc. For available options, refer to [loss_scale module](https://github.com/modelscope/ms-swift/blob/main/swift/loss_scale/mapping.py). ms-swift supports mixing basic strategies with other strategies, for example: `'default+ignore_empty_think'`, `'last_round+ignore_think_prefix'`. If no basic strategy is specified, it defaults to 'default', for example: 'hermes' is equivalent to 'default+hermes'.
   - 'default': All responses (including history) are calculated with weight 1 for cross-entropy loss (**system/user/multimodal tokens in messages and `tool_response` parts in Agent training are not included in loss calculation**). (**Default value for SFT**)
   - 'last_round': Only calculate loss for the last round response. The last round means all content after the last "user". (**Default value for RLHF**)
   - 'all': Calculate loss for all tokens. (**Default value for `swift pt`**)
   - 'ignore_empty_think': Ignore loss computation for empty `'<think>\n\n</think>\n\n'` (as long as it matches the regex `'<think>\\s*</think>\\s*'`).
+  - 'ignore_think_prefix': Ignore loss computation for `'<think>\n'` at the start of a response (or `'<think>'` when no newline follows). The following reasoning content and `'</think>'` still contribute to the loss.
   - 'react', 'hermes', 'qwen': Adjust the loss weight of the `tool_call` part to 2.
+  - Note: Starting from `ms-swift >= 4.3.1`, multiple non-base strategies can be chained together (each strategy processes the output segments of the previous one, with weights multiplied accordingly). For example: `'last_round+hermes+ignore_empty_think'`, where `'last_round'` is the base strategy, and `'hermes+ignore_empty_think'` represents a chain of multiple non-base strategies that share the same base strategy.
+- disable_ignore_empty_think: Whether to disable the automatic appending of `ignore_empty_think` strategy to loss_scale for hybrid thinking models. Defaults to `False`, meaning for hybrid thinking models (e.g., Qwen3.5-4B), `+ignore_empty_think` is automatically appended to the loss_scale, so that empty `'<think>\n\n</think>\n\n'` blocks do not contribute to loss computation. If the user has already manually specified `ignore_empty_think` in the loss_scale, it will not be appended again. This parameter only takes effect during training and has no effect on pure thinking models or non-thinking models. Set to `True` to disable this default behavior.
+  - Note: This parameter was added in `ms-swift>=4.3.1`. In `ms-swift<4.3.1`, you need to manually add `--loss_scale ignore_empty_think`.
 - is_binary_loss_scale: When `loss_scale` can only take values of `0` or `1`, its semantics can be represented by `labels` instead — by setting the `labels` of positions where `loss_scale` is `0` to `-100`, thereby ensuring compatibility with `liger_kernel` and reducing memory usage. Defaults to `None` for automatic configuration.
 - sequence_parallel_size: Size for sequence parallelism. Default is 1. Currently supported in CPT/SFT/DPO/GRPO. Training scripts can be found [here](https://github.com/modelscope/ms-swift/tree/main/examples/train/sequence_parallel).
 - template_backend: Backend for template processing. Options are `'swift'` or `'jinja'`. Default is `'swift'`. If `'jinja'` is used, `apply_chat_template` from Transformers will be applied.
   - Note: The `'jinja'` backend only supports inference and does not support training (as it cannot determine the token ranges for loss computation).
 - response_prefix: The prefix string for responses, this parameter only takes effect during inference. Default is None, determined by the enable_thinking parameter and template type.
-- enable_thinking: This parameter takes effect during inference, indicating whether to enable thinking mode. Default is None, the default value is determined by the template (model) type (True for thinking/hybrid thinking templates, False for non-thinking templates). If enable_thinking is False, a non-thinking prefix is added, for example the Qwen3-8B hybrid thinking model adds the prefix `'<think>\n\n</think>\n\n'`, while Qwen3-8B-Thinking does not add a prefix. If enable_thinking is True, a thinking prefix is added, for example `'<think>\n'`. Note: The priority of this parameter is lower than the response_prefix parameter.
+- enable_thinking: This parameter takes effect during inference, indicating whether to enable thinking mode. Default is None, the default value is determined by the template (model) type (hybrid thinking/non-thinking templates default to `False`, thinking templates default to `True`). If enable_thinking is False, a non-thinking prefix is added, for example the Qwen3-8B hybrid thinking model adds the prefix `'<think>\n\n</think>\n\n'`, while Qwen3-8B-Thinking does not add a prefix. If enable_thinking is True, a thinking prefix is added, for example `'<think>\n'`. Note: The priority of this parameter is lower than the response_prefix parameter.
+  - Note: In `ms-swift<4.3.1`, the default value for hybrid thinking templates was `True`; this was changed to `False` in `ms-swift>=4.3.1`.
 - preserve_thinking: Whether to preserve historical thinking content during inference and training. When set to `True`, thinking content from all rounds is retained. When set to `False`, only the thinking content from the last round is retained (i.e., the content following the last user message). Defaults to `None`.
   - Default behavior: For thinking models (thinking/hybrid-thinking) or when `enable_thinking` is explicitly enabled, this is set to `False` by default during inference and training, retaining only the last round of thinking content. If the `loss_scale` base strategy during training is not `'last_round'` (e.g., `'default'`), it defaults to `True`, and historical thinking content will not be removed.
 - add_non_thinking_prefix: This parameter only takes effect during training, indicating whether to add a non-thinking prefix to data samples whose assistant part **does not start with the thinking marker `'<think>'`** (typically hybrid thinking models contain a non-thinking prefix). This feature allows swift's built-in datasets to train hybrid thinking models. Default value is True. For example: the non-thinking prefix for the Qwen3-8B hybrid thinking model is `'<think>\n\n</think>\n\n'`, while the non-thinking prefix for Qwen3-8B-Thinking/Instruct is `''`. Note: During training, if the basic strategy of loss_scale is last_round, this modification is only applied to the last round; otherwise, for example 'default' or 'all', this modification is applied to every round of data. If set to False, no non-thinking prefix is added to data samples.
@@ -252,7 +257,7 @@ This list inherits from the Transformers `Seq2SeqTrainingArguments`, with ms-swi
 - 🔥vit_lr: Specifies the learning rate for the ViT module when training multimodal models. Default is `None`, same as `learning_rate`. Typically used together with `--freeze_vit` and `--freeze_aligner`.
   - Note: The "learning_rate" printed in the logs is the learning rate of `param_groups[0]`, where the order of param_groups is vit, aligner, llm (if it contains trainable parameters).
 - 🔥aligner_lr: Specifies the learning rate for the aligner module in multimodal models. Default is `None`, same as `learning_rate`.
-- lr_scheduler_type: Type of learning rate scheduler. Default is `'cosine'`.
+- lr_scheduler_type: The type of learning rate scheduler, defaults to `'cosine'`. Common options: `'linear'`, `'constant'`, `'cosine_with_min_lr'`.
 - lr_scheduler_kwargs: Additional arguments for the learning rate scheduler. Default is `None`.
 - gradient_checkpointing_kwargs: Arguments passed to `torch.utils.checkpoint`. For example: `--gradient_checkpointing_kwargs '{"use_reentrant": false}'`. Default is `None`.
   - Note: When using DDP without DeepSpeed/FSDP and `gradient_checkpointing_kwargs` is `None`, it defaults to `'{"use_reentrant": false}'` to prevent errors.
@@ -295,7 +300,7 @@ Other important parameters:
 - 🔥ddp_find_unused_parameters: Default is `None`.
 - 🔥dataloader_num_workers: Default is `None`. On Windows, set to 0; otherwise, 1.
 - dataloader_pin_memory: Default is `True`.
-- dataloader_persistent_workers: Default is `False`.
+- dataloader_persistent_workers: Default is `True`; automatically set to `False` when `dataloader_num_workers=0`.
 - dataloader_prefetch_factor: Default is `None`. If `dataloader_num_workers > 0`, it is set to 2. Number of batches loaded in advance by each worker. 2 means there will be a total of 2 * num_workers batches prefetched across all workers.
 - train_dataloader_shuffle: Whether to shuffle the dataloader for CPT/SFT training, default is True. This parameter is ineffective for IterableDataset (i.e., it doesn't work for streaming datasets). IterableDataset reads data sequentially.
 - optim: The optimizer, defaults to `"adamw_torch"` (for torch>=2.8 `"adamw_torch_fused"`). For a complete list of optimizers, please see `OptimizerNames` in [training_args.py](https://github.com/huggingface/transformers/blob/main/src/transformers/training_args.py).
@@ -321,6 +326,7 @@ Other important parameters:
   - Note: The behavior of `'all-linear'` differs between LLMs and multimodal LLMs. For standard LLMs, it automatically finds all linear layers except `lm_head` and attaches tuners. **For multimodal LLMs, tuners are by default only attached to the LLM component; this behavior can be controlled via `freeze_llm`, `freeze_vit`, and `freeze_aligner`**.
 - 🔥target_regex: A regular expression to specify LoRA modules. Default is `None`. If provided, `target_modules` is ignored. For example: `--target_regex '^(language_model).*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'` applies LoRA to modules matching the pattern. This argument is not limited to LoRA and can be used with other tuners.
 - target_parameters: List of parameter names (not module names) to replace with LoRA. Similar in behavior to `target_modules`, but operates at the parameter level. Requires "peft>=0.17.0". This is useful for models like Mixture-of-Experts (MoE) layers in Hugging Face Transformers, which may use `nn.Parameter` instead of `nn.Linear`.
+  - Note: This parameter requires `lora_dropout` to be set to 0.
 - init_weights: Method for initializing weights. For LoRA: options are 'true', 'false', 'gaussian', 'pissa', 'pissa_niter_[number of iters]', 'olora', 'loftq', 'lora-ga'. For Bone: 'true', 'false', 'bat'. Default is 'true'.
 - 🔥modules_to_save: Additional original model modules to include in training and saving, even after attaching a tuner. Default is `[]`. Applies to tuners beyond LoRA. For example: `--modules_to_save embed_tokens lm_head` enables training of `embed_tokens` and `lm_head` during LoRA training, and their weights will be saved in `adapter_model.safetensors`.
 
@@ -509,15 +515,16 @@ Parameter meanings can be found in the [lmdeploy documentation](https://lmdeploy
 
 ### Training Arguments
 
-Training arguments include the [base arguments](#base-arguments), [Seq2SeqTrainer arguments](#Seq2SeqTrainer-arguments), [tuner arguments](#tuner-arguments), and also include the following parts:
+Training arguments include the [base arguments](#base-arguments), [Seq2SeqTrainer arguments](#seq2seqtrainer-arguments), [tuner arguments](#tuner-arguments), and also include the following parts:
 
 - add_version: Add directory to `output_dir` with `'<version>-<timestamp>'` to prevent weight overwrite, default is True.
 - check_model: Check local model files for corruption or modification and give a prompt, default is True. **If in an offline environment, please set to False.**
 - 🔥create_checkpoint_symlink: Creates additional checkpoint symlinks to facilitate writing automated training scripts. The symlink paths for `best_model` and `last_model` are `f'{output_dir}/best'` and `f'{output_dir}/last'` respectively.
 - 🔥packing: Uses the `padding_free` approach to pack data samples of different lengths into samples of **approximately** uniform length (packing ensures complete sequences are not split), achieving load balancing across nodes and processes during training (avoiding long texts slowing down short text training speed), thereby improving GPU utilization and maintaining stable memory usage. When using `--attn_impl flash_attn`, it ensures that different sequences within packed samples are independent and invisible to each other. This parameter defaults to `False` and currently supports packing for CPT/SFT/DPO/KTO/GKD as well as embedding/reranker/seq_cls tasks. Note: **packing will reduce the number of dataset samples, please adjust gradient accumulation and learning rate accordingly**.
-  - Note: For Qwen3-Next/Qwen3.5 packing, please use Megatron-SWIFT. Refer to [Qwen3.5 Best Practice](../BestPractices/Qwen3_5-Best-Practice.md) for details.
+  - Note: For Qwen3-Next packing, please use Megatron-SWIFT. For Qwen3.5 transformers padding_free/packing support, please use "ms-swift>=4.3.1" (or use Megatron-SWIFT). Refer to [Qwen3.5/Qwen3.6/Qwen3.8 Best Practices](../BestPractices/Qwen3_8-Best-Practice.md) for details.
 - packing_length: the length to use for packing. Defaults to None, in which case it is set to max_length.
 - packing_num_proc: Number of processes for packing, default is 1. Note that different values of `packing_num_proc` will result in different packed datasets. (This parameter does not take effect during streaming packing). Usually there is no need to modify this value, as packing speed is much faster than tokenization speed.
+- packing_strategy: Packing algorithm, one of 'binpack' and 'sequential', default is 'binpack'. 'binpack' uses best-fit-decreasing bin packing (which reorders samples by length); 'sequential' uses order-preserving greedy packing (next-fit: a single open pack, flushed when the next sample doesn't fit), keeping samples in input order so the sample order and pack boundaries follow a sequential sampler (use `packing_num_proc=1` for a single global ordering).
 - lazy_tokenize: Whether to use lazy tokenization. If set to `False`, all dataset samples will be tokenized (and for multimodal models, images will be loaded from disk) before training begins. Default is `None`: in LLM training, it defaults to `False`; in MLLM training, it defaults to `True` to save memory.
   - Note: If you want to perform image data augmentation, you need to set `lazy_tokenize` (or `streaming`) to True and modify the `encode` method in the Template class.
 - use_logits_to_keep: Pass `logits_to_keep` in the `forward` method based on labels to reduce the computation and storage of unnecessary logits, thereby reducing memory usage and accelerating training. The default is `None`, which enables automatic selection.
@@ -526,6 +533,8 @@ Training arguments include the [base arguments](#base-arguments), [Seq2SeqTraine
 - temperature: Generation parameter override. The temperature setting when `predict_with_generate=True`, defaulting to 0.
 - optimizer: The optimizer plugin to use (takes priority over `--optim`), default is None. Available optimizers can be found [here](https://github.com/modelscope/ms-swift/blob/main/swift/optimizers/mapping.py).
 - loss_type: Custom loss_type name. Default is None, uses the model's built-in loss function. Available loss options can be found [here](https://github.com/modelscope/ms-swift/blob/main/swift/loss/mapping.py).
+- mrl_dims: Dimension configuration for [Matryoshka Representation Learning (MRL)](https://arxiv.org/abs/2205.13147) on embedding training. Default is None. Format is `Dict[int, float]` or a JSON string, where the key is the truncated embedding dimension and the value is the corresponding loss weight, e.g. `'{"32": 1.0, "64": 1.0, "128": 1.0}'`. When enabled, the trainer slices `last_hidden_state` to each dimension, applies L2 normalization, and aggregates the per-dimension `loss_type` losses with the configured weights. Only effective when `task_type='embedding'`.
+  - Note: The maximum supported embedding dimension is determined by `hidden_size` in the model's `config.json`. Any key-value pair whose key is greater than `hidden_size` will be silently ignored.
 - eval_metric: Custom eval metric name. Default is None. Available eval_metric options can be found [here](https://github.com/modelscope/ms-swift/blob/main/swift/metrics/mapping.py).
   - Regarding default values: When `task_type` is 'causal_lm' and `predict_with_generate=True`, it defaults to 'nlg'. When `task_type` is 'embedding', the default value is 'infonce' or 'paired' based on loss_type. When `task_type` is 'reranker/generative_reranker', the default value is 'reranker'.
 - callbacks: Custom trainer callbacks, default is `[]`. Available callbacks can be found [here](https://github.com/modelscope/ms-swift/blob/main/swift/callbacks/mapping.py).For example,enable elastic training by adding `deepspeed_elastic` (and optionally `graceful_exit`) in `callbacks`. See the [Elastic guide](../BestPractices/Elastic.md).
@@ -576,14 +585,12 @@ RLHF arguments inherit from the [training arguments](#training-arguments).
 - temperature: Default is 0.9; this parameter will be used in PPO, GRPO and GKD.
 - top_k: Top-k parameter for rollout sampling. -1 means no top-k filtering is applied. Default is -1.
 - top_p: Top-p parameter for rollout sampling. 1.0 means no top-p filtering is applied. Default is 1.0.
+- min_p: Min-p parameter for rollout sampling. Tokens whose probability is below `min_p` times the probability of the most likely token are filtered out. 0.0 means no min-p filtering is applied. Default is 0.0. Only effective with the vLLM backend.
 
 #### GKD Arguments
 - lmbda: Default is 0.5. This parameter is used in GKD. It controls the lambda parameter for the proportion of student data (i.e., the proportion of student-generated outputs within the strategy). If lmbda is 0, student-generated data is not used.
 - sft_alpha: The default value is 0. It controls the weight of sft_loss added in GKD. The final loss is `gkd_loss + sft_alpha * sft_loss`.
-- seq_kd: Default is False. This parameter is used in GKD. It is the `seq_kd` parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised fine-tuning on teacher-generated output).
-  - Note: You can perform inference on the dataset using the teacher model in advance (accelerated by inference engines such as vLLM, SGLang, or lmdeploy), and set `seq_kd` to False during training. Alternatively, you can set `seq_kd` to True, which will use the teacher model to generate sequences during training (ensuring different generated data across multiple epochs, but at a slower efficiency).
-- gkd_logits_topk: Use Top-K logits to compute KL divergence. Defaults to None, which means the full vocabulary is used. Setting this parameter can effectively reduce peak GPU memory usage during training. This parameter is required when teacher_model_server is configured. See [GKD documentation](./GKD.md#top-k-kl-computation) for more details.
-- offload_teacher_model: Whether to offload the teacher model to save GPU memory. If set to True, the teacher model will be loaded only during generate/logps computation. Default: False.
+- gkd_logits_topk: Use Top-K logits to compute KL divergence. Defaults to None, which means the full vocabulary is used. Setting this parameter can effectively reduce peak GPU memory usage during training. This parameter is required when teacher_model_server is configured. See [distillation documentation](./Distillation.md#top-k-kl-computation) for more details.
 - truncation_strategy: The method to handle inputs exceeding `max_length`. Supported values are `delete` and `left`, representing deletion and left-side truncation respectively. The default is `left`. With the delete strategy, over-long or encoding-failed samples are discarded, and new samples are resampled from the original dataset to maintain the intended batch size.
 - log_completions: Whether to log the model-generated content during training, to be used in conjunction with `--report_to wandb/swanlab`, default is False.
   - Note: If `--report_to wandb/swanlab` is not set, a `completions.jsonl` will be created in the checkpoint to store the generated content.
@@ -591,18 +598,20 @@ RLHF arguments inherit from the [training arguments](#training-arguments).
 
 #### Reward/Teacher Model Parameters
 
-The reward model parameters will be used in PPO and GRPO. The teacher model parameters will be used in GKD.
+The reward model parameters will be used in PPO and GRPO. The teacher model parameters will be used in GKD and GRPO.
 
 - reward_model: Default is None.
 - reward_adapters: Default is `[]`.
 - reward_model_type: Default is None.
 - reward_model_revision: Default is None.
-- teacher_model: Default is None. This parameter must be provided when `rlhf_type` is `'gkd'`.
-- teacher_adapters: Default is `[]`.
+- teacher_model: Default is None.
+- teacher_adapters: Paths to LoRA weights loaded into `teacher_model`. Default is `[]`. When specified together with `teacher_model`, a separate frozen teacher is loaded even if `teacher_model` equals `model`, adding another copy of the base weights in memory instead of using the `disable_adapter()` optimization.
 - teacher_model_type: Default is None.
 - teacher_model_revision: Default is None.
-- teacher_model_server: The address of the teacher model server, e.g. `http://localhost:8000`. This should be a service deployed via `vllm serve` for computing top-k log probabilities.
+- teacher_model_server: Teacher model service URL. Deploy via `swift deploy` for logprobs. Single URL (e.g. `http://localhost:8000`) or multi-teacher JSON (e.g. `'[{"url":"http://t1:8000","tags":["data/math.jsonl"]},{"url":"http://t2:8001","tags":["data/code.jsonl"]}]'`). How `tags` map to datasets or sample fields: [distillation docs](./Distillation.md#multi-teacher-routing).
+- teacher_tag_key: Column name for multi-teacher routing; sample values are matched to each teacher's `tags`. Default is `"dataset"`. With multiple `--dataset` values, match each entry; or use a custom column (e.g. `teacher_tag`) via `--teacher_tag_key teacher_tag`.
 - teacher_deepspeed: Same as the deepspeed parameter, controls the DeepSpeed configuration for the teacher model. By default, uses the DeepSpeed configuration of the training model.
+- offload_teacher_model: Whether to offload the teacher model to save GPU memory. Loaded only during sampling/logps computation. Only effective when `teacher_model` is set. Default is False.
 
 
 #### PPO Arguments
@@ -635,7 +644,7 @@ The meanings of the following parameters can be referenced [here](https://huggin
 - reward_funcs: Reward functions in the GRPO algorithm; options include `accuracy`,`format`,`cosine`,`repetition` and `soft_overlong`, as seen in `swift/rewards/orm.py`. You can also customize your own reward functions in the plugin. Default is `[]`.
 - reward_weights: Weights for each reward function. The number should be equal to the sum of the number of reward functions and reward models. If `None`, all rewards are weighted equally with weight `1.0`.
   - Note: If `--reward_model` is included in GRPO training, it is added to the end of the reward functions.
-- reward_model_plugin: The logic for the reward model, which defaults to ORM logic. For more information, please refer to [Customized Reward Models](./GRPO/DeveloperGuide/reward_model.md#custom-reward-model).
+- reward_model_plugin: The logic for the reward model, which defaults to ORM logic. For more information, please refer to [Customized Reward Models](./GRPO/DeveloperGuide/reward_model.md#custom-reward-models).
 - dataset_shuffle: Whether to shuffle the dataset randomly. Default is True.
 - truncation_strategy: The method to handle inputs exceeding `max_length`. Supported values are `delete` and `left`, representing deletion and left-side truncation respectively. The default is `left`. With the delete strategy, over-long or encoding-failed samples are discarded, and new samples are resampled from the original dataset to maintain the intended batch size.
 - loss_type: The type of loss normalization. Options are ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'real', 'fipo'], default is 'grpo'. For details, refer to this [doc](./GRPO/DeveloperGuide/loss_types.md)
@@ -657,7 +666,7 @@ The meanings of the following parameters can be referenced [here](https://huggin
   - async_generate: Use async rollout to improve train speed. Note that rollout will use the model updated in the previous round when enabled. Multi-turn scenarios are not supported. Default is `false`.
   - enable_flattened_weight_sync: Whether to use flattened tensor for weight synchronization. When enabled, multiple parameters are packed into a single contiguous tensor for transfer, which can improve synchronization efficiency; Only takes effect in Server Mode. Default is True.
   - SWIFT_UPDATE_WEIGHTS_BUCKET_SIZE: An environment variable that controls the bucket size (in MB) for flattened tensor weight synchronization during full-parameter training in Server Mode. Default is 512 MB.
-- vllm_mode colocate parameter (For more parameter support, refer to the [vLLM Arguments](#vLLM-Arguments).)
+- vllm_mode colocate parameter (For more parameter support, refer to the [vLLM Arguments](#vllm-arguments).)
   - vllm_gpu_memory_utilization: vLLM passthrough parameter, default is 0.9.
   - vllm_max_model_len: vLLM passthrough parameter, the total length limit of model, default is None.
   - vllm_enforce_eager: vLLM passthrough parameter, default is False.
@@ -680,7 +689,7 @@ The meanings of the following parameters can be referenced [here](https://huggin
 - dynamic_sample: Exclude data within the group where the reward standard deviation is 0, and additionally sample new data. Default is False.
 - max_resample_times: Under the dynamic_sample setting, limit the number of resampling attempts to a maximum of 3. Default is 3 times.
 - overlong_filter: Skip overlong truncated samples, which will not be included in loss calculation. Default is False.
-The hyperparameters for the reward function can be found in the [Built-in Reward Functions section](#built-in-reward-functions).
+The hyperparameters for the reward function can be found in the [Reward function parameters section](#reward-function-parameters).
 - delta: Delta value for the upper clipping bound in two-sided GRPO. Recommended to be > 1 + epsilon. This method was introduced in the [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291).
 - importance_sampling_level: Controls how the importance sampling ratio is computed. Options are `token` and `sequence`. In `token` mode, the raw per-token log-probability ratios are used. In `sequence` mode, the log-probability ratios of all valid tokens in the sequence are averaged to produce a single ratio per sequence. The [GSPO paper](https://arxiv.org/abs/2507.18071) uses sequence-level importance sampling to stabilize training. The default is `token`.
 - advantage_estimator: Advantage estimator. Default is `grpo` (group-relative advantage). Options: `grpo`, [`rloo`](./GRPO/AdvancedResearch/RLOO.md), [`reinforce_plus_plus`](./GRPO/AdvancedResearch/REINFORCEPP.md).
@@ -688,12 +697,23 @@ The hyperparameters for the reward function can be found in the [Built-in Reward
 - scale_rewards: Specifies the reward scaling strategy. Options: `group` (scale by intra-group std), `batch` (scale by batch-wide std), `none` (no scaling), `gdpo` (normalize each reward function separately within groups before weighted aggregation, see [GDPO paper](https://arxiv.org/abs/2601.05242)). The default is bound to `advantage_estimator`: `group` for `grpo`, `none` for `rloo`, and `batch` for `reinforce_plus_plus`.
   - Note: `gdpo` mode does not support `kl_in_reward=True`. If both are set, `kl_in_reward` will be automatically set to `False`.
   - GDPO is designed for multi-reward optimization: When using multiple reward functions, GDPO normalizes each reward function separately within groups (subtract mean, divide by std), then performs weighted aggregation using `reward_weights`, and finally applies batch-level normalization. This approach better preserves the relative differences between rewards and prevents different reward combinations from collapsing into identical advantage values.
+- teacher_kl_coef: Coefficient for teacher KL in OPD-RL, i.e. `adv_t = base_adv + teacher_kl_coef * teacher_kl`. Default is 1.0.
+- advantage_reweight: Advantage reweighting algorithm. Default is None (disabled). Option: `rlsd` ([RLSD, Self-Distilled RLVR](https://arxiv.org/abs/2604.03128)), which redistributes the per-sequence GRPO advantage across tokens using the teacher-vs-student log-probability gap on the same sampled tokens, i.e. `delta_t = logP_T(y_t) - logP_S(y_t)`, `w_t = exp(sign(A) * delta_t)`, `reweight = (1 - λ) + λ * clip(w_t)`, `A_hat_t = A * reweight`. The reweight is strictly positive and never flips the sign of the environment reward. When enabled it requires `reward_funcs` (the reweight direction uses `sign(A)`) and a `teacher_prompt` column in the dataset (the privileged prompt, e.g. question + reference solution / ground-truth answer); it is incompatible with `use_liger_kernel`, `loss_type in [real, fipo]`, `off_policy_sequence_mask_delta`, and `teacher_model_server`. Teacher modes: without `--teacher_model` it runs dynamic self-distillation (teacher = current policy scored on the privileged prompt); with `--teacher_model <ckpt>` it uses a frozen local teacher (scored under no_grad, never updated during training).
+- rlsd_lambda: RLSD mixing weight, `reweight = (1 - λ) + λ * clip(w_t)`. `0` reduces to plain GRPO, `1` is full RLSD reweighting. Must be in [0, 1]. Default is 0.5.
+- rlsd_reweight_clip_range: Evidence-weight clip range eps_w. Clips `w_t = exp(sign(A) * delta_t)` to `[1 - eps_w, 1 + eps_w]` to prevent overly large multipliers from the teacher/student log-prob gap. Must be >= 0. Default is 0.2.
+- rlsd_lambda_warmup_steps: Number of steps to linearly warm up λ from 0 to `rlsd_lambda`. Default is 0 (no warmup).
+- rlsd_lambda_decay_steps: Number of steps to linearly decay λ from `rlsd_lambda` to 0 after warmup. Default is 0 (no decay; λ stays constant).
+- rlsd_negative_only: Whether to reweight only sequences with negative advantage (`A < 0`, i.e. incorrect responses); sequences with non-negative advantage keep plain GRPO advantages. Default is False.
+- sdar_loss_coef: Coefficient for the SDAR ([Self-Distilled Agentic RL](https://arxiv.org/abs/2605.15155)) confidence-gated teacher distillation auxiliary loss, added to the GRPO policy loss: `loss = policy_loss + sdar_loss_coef * L_SDAR`, where `L_SDAR = token-mean(sigmoid(sdar_gate_beta * delta_t) * delta_t)` and `delta_t = logP_T(y_t) - logP_S(y_t)`. The gate and teacher log-probs are detached, so gradients flow only through the student. It reuses the OPSD self-distillation teacher (teacher = current policy conditioned on a privileged `teacher_prompt` column) for the per-token teacher log-probs, and unlike RLSD leaves the GRPO advantage unchanged. Enabled when `> 0`; incompatible with `use_liger_kernel`, `advantage_reweight=rlsd`, and `teacher_model_server`. Default is 0.0 (disabled); the reference uses 0.1 (0.01 for ALFWorld).
+- sdar_gate_beta: Temperature of the SDAR sigmoid gate `sigmoid(sdar_gate_beta * delta_t)`; higher values sharpen the gating. Must be > 0. Default is 5.0.
 - sync_ref_model: Whether to synchronize the reference model. Default is False.
   - ref_model_mixup_alpha: The Parameter controls the mix between the current policy and the previous reference policy during updates. The reference policy is updated according to the equation: $π_{ref} = α * π_θ + (1 - α) * π_{ref_{prev}}$. Default is 0.6.
   - ref_model_sync_steps：The parameter determines how frequently the current policy is synchronized with the reference policy. Default is 512.
 - move_model_batches: When moving model parameters to fast inference frameworks such as vLLM/LMDeploy, determines how many batches to divide the layers into. The default is `None`, which means the entire model is not split. Otherwise, the model is split into `move_model_batches + 1` (non-layer parameters) + `1` (multi-modal component parameters) batches.
 - multi_turn_scheduler: Multi-turn GRPO parameter; pass the corresponding plugin name, and make sure to implement it in plugin/multi_turn.py.
 - max_turns: Maximum number of rounds for multi-turn GRPO. The default is None, which means there is no limit.
+- gym_env: Globally select the gym environment name (must be registered in the plugin). Defaults to None and can be overridden per row via `env_config.name`. See the [documentation](./GRPO/DeveloperGuide/gym_env.md).
+- use_gym_env: Whether to use the env-provided `total_reward` as the reward (no reward function required). Defaults to None; when not set explicitly, it is auto-enabled if `gym_env` is set, otherwise inherited from the rollout server in server mode, and False in all other cases.
 - top_entropy_quantile: Only tokens whose entropy ranks within the specified top quantile are included in the loss calculation. The default is 1.0, which means low-entropy tokens are not filtered. For details, refer to the [documentation](./GRPO/AdvancedResearch/entropy_mask.md).
 - log_entropy: Logs the entropy values during training. The default is False. For more information, refer to the [documentation](./GRPO/GetStarted/GRPO.md#logged-metrics).
 - rollout_importance_sampling_mode: Training-inference mismatch correction mode. Options are `token_truncate`, `token_mask`, `sequence_truncate`, `sequence_mask`. Default is None (disabled). For details, refer to the [documentation](./GRPO/AdvancedResearch/training_inference_mismatch.md).
@@ -724,7 +744,7 @@ Soft overlong reward parameters:
 
 ### Inference Arguments
 
-Inference arguments include the [base arguments](#base-arguments), [merge arguments](#merge-arguments), [vLLM arguments](#vllm-arguments), [LMDeploy arguments](#LMDeploy-arguments), and also contain the following:
+Inference arguments include the [base arguments](#base-arguments), [merge arguments](#merge-arguments), [vLLM arguments](#vllm-arguments), [LMDeploy arguments](#lmdeploy-arguments), and also contain the following:
 
 - 🔥infer_backend: Inference acceleration backend, supporting four inference engines: 'transformers', 'vllm', 'sglang', and 'lmdeploy'. The default is 'transformers'.
   - Note: All four engines use SWIFT's template, controlled by `--template_backend`.
@@ -754,8 +774,11 @@ Deployment Arguments inherit from the [inference arguments](#inference-arguments
 The rollout parameters inherit from the [deployment parameters](#deployment-arguments).
 - multi_turn_scheduler: The scheduler for multi-turn GRPO training. Pass the corresponding plugin name, and ensure the implementation is added in `plugin/multi_turn.py`. Default is `None`. See [documentation](./GRPO/DeveloperGuide/multi_turn.md) for details.
 - max_turns: Maximum number of turns in multi-turn GRPO training. Default is `None`, meaning no limit.
+- gym_env: Globally select the gym environment name (must be registered in the plugin). Defaults to None and can be overridden per row via `env_config.name`. See the [documentation](./GRPO/DeveloperGuide/gym_env.md).
+- use_gym_env: Whether to enable gym-environment mode (rollout emits `total_reward` for the trainer to consume). Defaults to None; when not set explicitly, it is auto-enabled if `gym_env` is set.
 - vllm_enable_lora: Enable the vLLM engine to load LoRA adapters; defaults to False. Used to accelerate weight synchronization during LoRA training. See the [documentation](./GRPO/GetStarted/GRPO.md#weight-sync-acceleration) for details.
 - vllm_max_lora_rank: LoRA parameter for the vLLM engine. Must be greater than or equal to the training lora_rank; it is recommended to set them equal. Defaults to 16.
+- vllm_enable_expert_parallel: Enable Expert Parallel (EP) for MoE models, distributing experts across ranks. Valid when vllm_use_async_engine is true. Default is False.
 
 ### Web-UI Arguments
 - server_name: Host for the web UI, default is '0.0.0.0'.
@@ -843,6 +866,11 @@ In addition to the parameters listed above, some models support additional model
 
 - Model-specific parameters can be set via `--model_kwargs` or environment variables. For example: `--model_kwargs '{"fps_max_frames": 12}'` or `FPS_MAX_FRAMES=12`.
 - Note: If you specify model-specific parameters during training, please also set the corresponding parameters during inference to achieve optimal performance.
+
+
+### deepseek_v4, deepseek_v4_flash, glm5_2, glm5_3, hy_v3_preview
+- 🔥REASONING_EFFORT: Thinking effort, effective only when thinking is enabled (except for `glm5_3`, which has no non-thinking mode and always applies it). The accepted values vary by model: `'high'`/`'max'` for `deepseek_v4` (default `'high'`); `'low'`/`'high'`/`'max'` for `deepseek_v4_flash` (default `'low'`); `'high'`/`'max'` for `glm5_2` (default `'max'`); `'low'`/`'high'`/`'max'` for `glm5_3` (default `'max'`); `'no_think'`/`'low'`/`'high'` for `hy_v3_preview` (default `'high'`).
+  - It can also be set per sample by passing `chat_template_kwargs` in the dataset or the inference request, e.g. `{"chat_template_kwargs": {"reasoning_effort": "max"}}`, which takes precedence over the environment variable.
 
 
 ### qwen2_vl, qvq, qwen2_5_vl, mimo_vl, keye_vl, keye_vl_1_5
@@ -975,3 +1003,8 @@ The meanings of the following parameters can be found in the example code [here]
 - SWIFT_TIMEOUT: If the multimodal dataset contains image URLs, this parameter controls the timeout for fetching images, defaulting to 20 seconds.
 - ROOT_IMAGE_DIR: The root directory for image (multimodal) resources. By setting this parameter, relative paths in the dataset can be interpreted relative to `ROOT_IMAGE_DIR`. By default, paths are relative to the current working directory.
 - SWIFT_SINGLE_DEVICE_MODE: Single device mode, valid values are "0"(default)/"1". In this mode, each process can only see one device.
+- SWIFT_AUDIO_LOAD_BACKEND: Audio waveform loading backend. `librosa` (default) or `soundfile_pyav` (soundfile first, pyav fallback). For GRPO/GKD with `--use_vllm true`,swift auto-sets it to `soundfile_pyav` so training encode and vLLM rollout decode audio URLs consistently.
+- SWIFT_ALLOW_INTERNAL_URL: Defaults to `'0'`. When `swift deploy` downloads image, audio, or video URLs from a request into local temporary files, it refuses URLs that resolve to non-public addresses such as loopback and private ranges to prevent SSRF. Set it to `'1'` only when trusted request URLs must reach an internal media server. Cloud metadata endpoints (`169.254.0.0/16`, Alibaba Cloud `100.100.100.200`, etc.) are always blocked.
+- SWIFT_URL_ALLOWED_HOSTS: A comma-separated allowlist of hosts, e.g. `bucket.oss-cn-hangzhou.aliyuncs.com,cdn.example.com`. When set, `swift deploy` fetches request media URLs only from listed hosts. An allowlisted host may resolve to an ordinary private address, but cloud metadata addresses remain blocked. This is recommended when deployment media comes from known bucket or CDN domains.
+- SWIFT_MAX_DOWNLOAD_SIZE_MB: Maximum size of one response body fetched for request media by `swift deploy`, defaulting to `1024` (1GB). This prevents an untrusted caller from exhausting memory and temporary disk space with a huge or endless response. Set it to `0` to disable the cap.
+- SWIFT_MEDIA_ALLOWED_DIRS: A comma-separated allowlist of **absolute** directories, e.g. `/data/images,/data/videos`. When set, local media paths referenced by deployment requests must be inside these directories; symlinks and `..` are resolved before comparison. It is unset by default for compatibility, so deployment requests can otherwise read any accessible local media file. Configure it when `swift deploy` is exposed to untrusted callers; point it at an empty directory to prohibit requests from referencing local files.

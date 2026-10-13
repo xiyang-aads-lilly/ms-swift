@@ -108,6 +108,8 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
             no filtering. Defaults to -1.
         top_p (float): If set to a float < 1, only the smallest set of most probable tokens with probabilities that
             add up to top_p or higher are kept for generation. Defaults to 1.0.
+        min_p (float): Minimum token probability, scaled by the probability of the most likely token. Tokens below
+            the resulting threshold are filtered out. 0.0 means no filtering. Defaults to 0.0.
         repetition_penalty (float): The parameter for repetition penalty. 1.0 means no penalty. Defaults to 1.0.
         stop_words (List[str]): A list of strings that will stop the generation when they are generated. Defaults to an
             empty list.
@@ -159,6 +161,7 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
     # generation args
     top_k: int = -1
     top_p: float = 1.0
+    min_p: float = 0.0
     repetition_penalty: float = 1.
     stop_words: List[str] = field(default_factory=list)
 
@@ -191,6 +194,8 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
 
     generation_batch_size: Optional[int] = None
     steps_per_generation: Optional[int] = None
+
+    teacher_tag_key: str = 'dataset'
 
     def _init_generation_batch_params(self):
         num_generations = getattr(self, 'num_generations', 1)
@@ -288,6 +293,15 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
             turns, while 'per_round' limits the output length for each turn. Defaults to 'per_round'.
         vllm_server_pass_dataset (bool): Pass extra dataset information to the vLLM server, used for
             multi-turn training. Defaults to False.
+        use_gym_env (Optional[bool]): If set, the trainer treats `rollout_infos['total_reward']` produced
+            by a gym-style multi-turn scheduler as the reward (no reward function needed). Works in both
+            `server` and `colocate` modes, and on the Megatron trainer. When `None` (default), it auto-defaults
+            to `True` if `gym_env` is set; otherwise it is auto-detected from the connected vLLM server in
+            `server` mode and `False` otherwise. An explicit value here is authoritative — it is never
+            overridden by the value reported by the rollout server.
+        gym_env (Optional[str]): Default gym environment name used by the `gym_scheduler`. Equivalent to
+            `--gym_env` on `swift rollout` but for the trainer-side colocate path; per-row `env_config.name`
+            still wins over this default. Defaults to None.
         dynamic_sample (bool): If True, filters out data with a reward standard deviation of 0 within a group
             and samples new data. Defaults to False.
         max_resample_times (int): When `dynamic_sample` is enabled, this limits the number of resampling
@@ -389,6 +403,8 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     max_turns: Optional[int] = None
     completion_length_limit_scope: Literal['total', 'per_round'] = 'per_round'
     vllm_server_pass_dataset: bool = False
+    use_gym_env: Optional[bool] = None
+    gym_env: Optional[str] = None
 
     # DAPO, https://arxiv.org/abs/2503.14476
     dynamic_sample: bool = False
@@ -419,6 +435,30 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # If false, add KL into loss, otherwise add into reward
     kl_in_reward: Optional[bool] = None  # rloo/reinforce_plus_plus: true, grpo: false (default)
 
+    # OPD-RL (On-Policy Distillation as RL)
+    # enabled when a teacher (teacher_model / teacher_model_server) is set on a GRPO run.
+    teacher_kl_coef: float = 1.0
+
+    # RLSD (Self-Distilled RLVR), https://arxiv.org/abs/2604.03128
+    # Token-level advantage reweighting using the teacher-vs-student logprob gap. Reuses the OPSD
+    # self-distillation teacher forward (teacher = current policy conditioned on the ground-truth
+    # answer via a per-sample ``teacher_prompt`` column). Set ``advantage_reweight='rlsd'`` to enable.
+    advantage_reweight: Optional[Literal['rlsd']] = None
+    rlsd_lambda: float = 0.5  # mixing weight: 0 -> pure GRPO, 1 -> full RLSD reweighting
+    rlsd_reweight_clip_range: float = 0.2  # eps_w: clip evidence weight to [1-eps_w, 1+eps_w]
+    rlsd_lambda_warmup_steps: int = 0  # linear warmup of lambda from 0 to rlsd_lambda
+    rlsd_lambda_decay_steps: int = 0  # linear decay of lambda to 0 over this many steps
+    rlsd_negative_only: bool = False  # only reweight sequences with advantage < 0
+
+    # SDAR (Self-Distilled Agentic RL), https://arxiv.org/abs/2605.15155
+    # Confidence-gated teacher distillation auxiliary loss added to the GRPO policy loss:
+    #   L_SDAR = token-mean( sigmoid(sdar_gate_beta*(logP_T-logP_S)) * (logP_T-logP_S) ),
+    #   loss   = policy_loss + sdar_loss_coef * L_SDAR.
+    # Reuses the OPSD self-distillation teacher (teacher = current policy conditioned on a privileged
+    # per-sample ``teacher_prompt`` column). Enabled when ``sdar_loss_coef > 0``.
+    sdar_loss_coef: float = 0.0  # 0 disables SDAR; reference uses 0.1 (0.01 for ALFWorld)
+    sdar_gate_beta: float = 5.0  # sigmoid gate temperature (higher -> sharper gating)
+
     # REAL https://arxiv.org/abs/2602.05630
     real_tau: float = 0.5
 
@@ -444,3 +484,10 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # and mask sequences where this delta > threshold AND advantage < 0
     # Falls back to old_per_token_logps if rollout_per_token_logps is not available
     off_policy_sequence_mask_delta: Optional[float] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        # gym_env implies use_gym_env unless the user said otherwise; mirrors deploy_args behavior so the
+        # default propagates to GRPOConfig too (not just RLHFArguments).
+        if self.use_gym_env is None and self.gym_env is not None:
+            self.use_gym_env = True

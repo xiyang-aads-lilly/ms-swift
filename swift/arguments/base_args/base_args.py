@@ -1,19 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import os
+import peft
 import shutil
 from dataclasses import dataclass, field, fields
 from packaging import version
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import swift
+from swift.dataset import load_dataset
 from swift.hub import get_hub
 from swift.model import get_ckpt_dir, get_model_processor, load_by_unsloth
 from swift.ray_utils import RayArguments
 from swift.template import Template, get_template
 from swift.tuner_plugin import tuners_map
 from swift.utils import (Processor, check_json_format, get_dist_setting, get_logger, import_external_file, is_dist,
-                         is_master, json_parse_to_dict, safe_snapshot_download, set_device, use_hf_hub)
+                         is_master, json_parse_to_dict, patch_dataloader_external_plugins, safe_snapshot_download,
+                         set_device, use_hf_hub)
 from .data_args import DataArguments
 from .generation_args import GenerationArguments
 from .model_args import ModelArguments
@@ -22,10 +25,50 @@ from .template_args import TemplateArguments
 
 logger = get_logger()
 
+# Environment variable blacklist
+_BLOCKED_MODEL_KWARGS = {
+    # Python interpreter
+    'PYTHONPATH',  # module search path injection (used in RCE exploit chain)
+    'PYTHONHOME',  # Python installation redirect
+    'PYTHONSTARTUP',  # auto-executed on interpreter startup
+    'PYTHONBREAKPOINT',  # arbitrary callable for breakpoint()
+    'PYTHONINSPECT',  # force interactive mode after script
+    # Dynamic linker injection (Linux)
+    'LD_PRELOAD',  # shared library injection
+    'LD_AUDIT',  # audit library injection
+    # Dynamic linker injection (macOS)
+    'DYLD_INSERT_LIBRARIES',
+    'DYLD_LIBRARY_PATH',
+    'DYLD_FALLBACK_LIBRARY_PATH',
+    # Shell auto-execution
+    'BASH_ENV',  # auto-sourced by non-interactive bash
+    'ENV',  # auto-sourced by some shells (POSIX sh)
+    'ZDOTDIR',  # zsh config directory redirect
+    # Other interpreters
+    'PERL5OPT',
+    'PERL5LIB',
+    'PERLLIB',
+    'NODE_OPTIONS',
+    'NODE_PATH',
+}
+
 
 def get_supported_tuners():
     return {'lora', 'full', 'longlora', 'adalora', 'llamapro', 'adapter', 'vera', 'boft', 'fourierft', 'reft', 'bone'
             } | set(tuners_map.keys())
+
+
+def _patch_peft():
+    """Patch peft functions that are incompatible with SWIFT.
+
+    1. _maybe_shard_state_dict_for_tp: TP sharding is not used by SWIFT, and causes errors
+       when torch.distributed is initialized (e.g. MoE training with target_parameters).
+    2. _maybe_shard_state_dict_for_tp internal logic accesses base_layer.weight.device which
+       fails for expert modules that don't have a `weight` attribute.
+    """
+    if version.parse(peft.__version__) >= version.parse('0.19.0'):
+        from peft.utils import save_and_load
+        save_and_load._maybe_shard_state_dict_for_tp = lambda model, state_dict, adapter_name: None
 
 
 @dataclass
@@ -59,6 +102,10 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         packing (bool): Whether to enable packing of datasets. Default is False.
         packing_length (Optional[int]): Length of packing. Default is None.
         packing_num_proc (int): Number of processes used for packing, Default is 1.
+        packing_strategy (Literal['binpack', 'sequential']): Packing algorithm. 'binpack' (default) uses
+            best-fit-decreasing bin packing (reorders samples); 'sequential' uses order-preserving greedy
+            packing (next-fit: a single open pack, flushed when the next sample doesn't fit) so the sample
+            order / pack boundaries follow a sequential sampler (use packing_num_proc=1). Default is 'binpack'.
         lazy_tokenize (Optional[bool]): Whether to enable lazy tokenization. Default is None.
         use_hf (bool): Whether to use Hugging Face for downloading/uploading models and datasets. If False,
             ModelScope is used. Default is False.
@@ -86,6 +133,7 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
     packing: bool = False
     packing_length: Optional[int] = None
     packing_num_proc: int = 1
+    packing_strategy: Literal['binpack', 'sequential'] = 'binpack'
     lazy_tokenize: Optional[bool] = None
     # hub
     use_hf: bool = False
@@ -132,6 +180,9 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
             return
         for external_plugin in self.external_plugins:
             import_external_file(external_plugin)
+        # A plugin's effect is an import side effect, which a forkserver/spawn dataloader worker does not
+        # inherit. Only patch when there is something to replay.
+        patch_dataloader_external_plugins()
         logger.info(f'Successfully imported external_plugins: {self.external_plugins}.')
 
     @staticmethod
@@ -150,6 +201,7 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         ]
 
     def __post_init__(self):
+        _patch_peft()
         self.swift_version = swift.__version__
         if self.use_hf or use_hf_hub():
             self.use_hf = True
@@ -182,10 +234,18 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
             logger.info('hub login successful!')
 
     def _init_model_kwargs(self):
-        """Prepare model kwargs and set them to the env"""
+        """Prepare model kwargs and set them to the env.
+
+        Blocks known-dangerous environment variables (PYTHONPATH, LD_PRELOAD,
+        etc.) that could enable arbitrary code execution via module/library
+        injection.
+        """
         self.model_kwargs: Dict[str, Any] = json_parse_to_dict(self.model_kwargs)
         for k, v in self.model_kwargs.items():
             k = k.upper()
+            if k in _BLOCKED_MODEL_KWARGS:
+                logger.warning(f'model_kwargs: `{k}` is blocked for security reasons, skipping')
+                continue
             os.environ[k] = str(v)
 
     @property
@@ -327,3 +387,20 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         res['num_labels'] = num_labels or self.num_labels
 
         return get_model_processor(**res)
+
+    def load_dataset(self):
+        dataset_kwargs = self.get_dataset_kwargs()
+        train_dataset, val_dataset = None, None
+        if self.dataset:
+            train_dataset, val_dataset = load_dataset(
+                self.dataset,
+                split_dataset_ratio=self.split_dataset_ratio,
+                shuffle=self.dataset_shuffle,
+                **dataset_kwargs)
+        if len(self.val_dataset) > 0:
+            # Loading val dataset
+            dataset_kwargs.pop('interleave_prob', None)
+            _, val_dataset = load_dataset(
+                self.val_dataset, split_dataset_ratio=1.0, shuffle=self.val_dataset_shuffle, **dataset_kwargs)
+            assert self.split_dataset_ratio == 0.
+        return train_dataset, val_dataset

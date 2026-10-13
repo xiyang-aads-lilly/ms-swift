@@ -50,6 +50,7 @@ class SwiftInfer(SwiftPipeline):
     @staticmethod
     def get_infer_engine(args: InferArguments, template=None, **extra_kwargs):
         infer_backend = extra_kwargs.pop('infer_backend', None) or args.infer_backend
+        engine_kwargs = extra_kwargs.pop('engine_kwargs', {})
         kwargs = {
             'model_id_or_path': args.model,
             'model_type': args.model_type,
@@ -85,6 +86,9 @@ class SwiftInfer(SwiftPipeline):
         else:
             raise ValueError(f'Inference backend `{infer_backend}` is not supported. '
                              'Please use one of: transformers, vllm, sglang, lmdeploy.')
+        if engine_kwargs:
+            kwargs['engine_kwargs'] = kwargs.get('engine_kwargs') or {}
+            kwargs['engine_kwargs'].update(engine_kwargs)
         kwargs.update(extra_kwargs)
         return infer_engine_cls(**kwargs)
 
@@ -209,8 +213,21 @@ class SwiftInfer(SwiftPipeline):
             labels.append(data['labels'])
         if args.metric == 'acc':
             mean_metric = MeanMetric()
-            for pred, label in zip(preds, labels):
-                mean_metric.update(pred == label)
+            if args.task_type == 'decision':
+                for data in data_list:
+                    response = data.get('response') or []
+                    target_probs = data.get('target_probs') or []
+                    for resp, tp in zip(response, target_probs):
+                        if not isinstance(resp, dict) or 'index' not in resp:
+                            continue
+                        if sum(tp) == 0:
+                            continue
+                        pred = resp['index']
+                        gold = max(range(len(tp)), key=lambda i: tp[i])
+                        mean_metric.update(pred == gold)
+            else:
+                for pred, label in zip(preds, labels):
+                    mean_metric.update(pred == label)
             res = {'acc': mean_metric.compute()['value']}
         elif args.metric == 'rouge':
             res = compute_rouge_bleu(preds, labels)

@@ -197,6 +197,36 @@ register_template(TeleChatTemplateMeta(LLMTemplateType.telechat))
 telechat_system = '你是中国电信星辰语义大模型，英文名是TeleChat，你是由中电信人工智能科技有限公司和中国电信人工智能研究院（TeleAI）研发的人工智能助手。'
 register_template(TeleChatTemplateMeta(LLMTemplateType.telechat2, default_system=telechat_system))
 
+
+class Xing4_0Template(Template):
+    """ref: https://modelscope.cn/models/XingChen-AGI/Xing4.0-29B-A4B (chat_template.jinja)"""
+
+    def __init__(self, *args, **kwargs):
+        # The jinja template turns thinking on unless `enable_thinking` is explicitly false, while the
+        # base class derives `is_thinking and not non_thinking_prefix` (i.e. False) for hybrid models.
+        if kwargs.get('enable_thinking') is None:
+            kwargs['enable_thinking'] = True
+        super().__init__(*args, **kwargs)
+
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.xing4_0,
+        prefix=['<_system>'],
+        system_prefix=['<_system>{{SYSTEM}}'],
+        prompt=['<_user>{{QUERY}}<_bot>'],
+        chat_sep=['<_end>\n'],
+        suffix=['<_end>\n'],
+        template_cls=Xing4_0Template,
+        agent_template='xing4_0',
+        is_thinking=True,
+        thinking_prefix='<think>\n',
+        non_thinking_prefix='</think>',
+        history_thinking_prefix='</think>',
+        # The official jinja template drops the reasoning of historical turns; match it so the
+        # rendered prompt is byte-for-byte identical to chat_template.jinja in every mode.
+        preserve_thinking=False))
+
 DBRX_SYSTEM = (
     'You are DBRX, created by Databricks. You were last updated in December 2023. '
     'You answer questions based on information available up to that point.\n'
@@ -337,7 +367,8 @@ register_template(
         agent_template='hunyuan_hermes'))
 
 
-class HyV3Template(Template):
+class HyV3PreviewTemplate(Template):
+    HYTK = ''
 
     def init_env_args(self):
         super().init_env_args()
@@ -347,7 +378,7 @@ class HyV3Template(Template):
         if self.reasoning_effort is None:
             self.reasoning_effort = 'high' if self.enable_thinking else 'no_think'
         self.enable_thinking = self.reasoning_effort != 'no_think'
-        self.chat_template_kwargs = {'reasoning_effort': self.reasoning_effort}
+        self.chat_template_kwargs['reasoning_effort'] = self.reasoning_effort
 
     def _get_enable_thinking(self, inputs=None):
         reasoning_effort = None if inputs is None else inputs.chat_template_kwargs.get('reasoning_effort')
@@ -363,28 +394,49 @@ class HyV3Template(Template):
         if inputs.tools:
             # For tool calls, append reasoning_mode after </tool_calls> in the tool instruction
             system = system.replace(
-                'you should print </tool_calls>',
-                f'you should print </tool_calls><｜reasoning_mode｜>reasoning_effort:{reasoning_effort}')
+                f'you should print </tool_calls{self.HYTK}>',
+                f'you should print </tool_calls{self.HYTK}><｜reasoning_mode{self.HYTK}｜>'
+                f'reasoning_effort:{reasoning_effort}')
         else:
             # For non-tool calls, append reasoning_mode to the system/prefix area
-            mode_str = f'<｜reasoning_mode｜>reasoning_effort:{reasoning_effort}'
+            mode_str = f'<｜reasoning_mode{self.HYTK}｜>reasoning_effort:{reasoning_effort}'
             system = (system or '') + mode_str
         return system
 
 
 register_template(
     TemplateMeta(
-        LLMTemplateType.hy_v3,
+        LLMTemplateType.hy_v3_preview,
         prefix=['<｜hy_begin▁of▁sentence｜>'],
         system_prefix=['<｜hy_begin▁of▁sentence｜>{{SYSTEM}}'],
         prompt=['<｜hy_User｜>{{QUERY}}<｜hy_Assistant｜>'],
         chat_sep=['<｜hy_eos｜>'],
         suffix=['<｜hy_eos｜>'],
-        template_cls=HyV3Template,
+        template_cls=HyV3PreviewTemplate,
         is_thinking=True,
         thinking_prefix='<think>',
         non_thinking_prefix='<think></think>',
         history_thinking_prefix='<think></think>',
+        agent_template='hy_v3_preview'))
+
+
+class HyV3Template(HyV3PreviewTemplate):
+    HYTK = ':opensource'
+
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.hy_v3,
+        prefix=['<｜hy_begin_of_sentence:opensource｜>'],
+        system_prefix=['<｜hy_begin_of_sentence:opensource｜>{{SYSTEM}}'],
+        prompt=['<｜hy_User:opensource｜>{{QUERY}}<｜hy_Assistant:opensource｜>'],
+        chat_sep=['<｜hy_eos:opensource｜>'],
+        suffix=['<｜hy_eos:opensource｜>'],
+        template_cls=HyV3Template,
+        is_thinking=True,
+        thinking_prefix='<think:opensource>',
+        non_thinking_prefix='<think:opensource></think:opensource>',
+        history_thinking_prefix='<think:opensource></think:opensource>',
         agent_template='hy_v3'))
 
 
@@ -441,6 +493,39 @@ register_template(
         prompt=['<role>HUMAN</role>{{QUERY}}<|role_end|><role>ASSISTANT</role>'],
         chat_sep=['<|role_end|>'],
         suffix=['<|role_end|>'],
+    ))
+
+
+class Ling3Template(Template):
+
+    def init_env_args(self):
+        super().init_env_args()
+        self.enable_thinking = get_env_args('enable_thinking', bool, True)
+
+    def _get_system(self, inputs: StdTemplateInputs) -> Optional[str]:
+        system = super()._get_system(inputs)
+        enable_thinking = self._get_enable_thinking(inputs)
+        thinking_option = 'on' if enable_thinking else 'off'
+        if system and ('detailed thinking on' in system or 'detailed thinking off' in system):
+            return system
+        if system:
+            return system + '\ndetailed thinking ' + thinking_option
+        return 'detailed thinking ' + thinking_option
+
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.ling3,
+        prefix=['<role>SYSTEM</role><|role_end|>'],
+        system_prefix=['<role>SYSTEM</role>{{SYSTEM}}<|role_end|>'],
+        prompt=['<role>HUMAN</role>{{QUERY}}<|role_end|><role>ASSISTANT</role>\n'],
+        chat_sep=['<|role_end|>'],
+        suffix=['<|role_end|>'],
+        template_cls=Ling3Template,
+        is_thinking=True,
+        thinking_prefix='<think>',
+        non_thinking_prefix='<think></think>',
+        agent_template='ling3',
     ))
 
 register_template(
@@ -543,4 +628,14 @@ register_template(
         chat_sep=['<|endoftext|>\n'],
         suffix=['<|endoftext|>'],
         stop_words=['<|endoftext|>'],
+    ))
+
+register_template(
+    QwenTemplateMeta(
+        LLMTemplateType.nemotron_h,
+        default_system=None,
+        is_thinking=True,
+        thinking_prefix='<think>\n',
+        stop_words=['<|im_end|>'],
+        agent_template='hermes',
     ))

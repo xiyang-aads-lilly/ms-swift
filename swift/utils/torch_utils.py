@@ -13,14 +13,47 @@ from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
 from datetime import timedelta
 from modelscope.hub.utils.utils import get_cache_dir
-from transformers.utils import is_torch_cuda_available, is_torch_mps_available, is_torch_npu_available
+from transformers.utils import (is_torch_cuda_available, is_torch_mps_available, is_torch_musa_available,
+                                is_torch_npu_available)
 from typing import Any, Mapping, Optional, Union
 
-from swift.utils import is_mp
-from .env import get_dist_setting, get_node_setting, is_dist, is_local_master, is_master
-from .logger import get_logger
+from .env import get_dist_setting, get_node_setting, is_dist, is_local_master, is_master, is_mp
 
-logger = get_logger()
+
+def nanstd(tensor: torch.Tensor, dim: Optional[Union[int, tuple]] = None, keepdim: bool = False) -> torch.Tensor:
+    """Compute the standard deviation of a tensor, ignoring NaNs.
+
+    Refer: trl/trainer/utils.py
+
+    Args:
+        tensor (`torch.Tensor`):
+            Input tensor.
+        dim (`int` or `tuple[int, ...]`, *optional*):
+            Dimension to reduce. Defaults to all dimensions.
+        keepdim (`bool`, *optional*, defaults to `False`):
+            Whether to keep reduced dimensions.
+
+    Returns:
+        `torch.Tensor`:
+            Standard deviation of the tensor, ignoring NaNs.
+    """
+    mean = torch.nanmean(tensor, dim=dim, keepdim=True)
+    variance = torch.nanmean((tensor - mean)**2, dim=dim, keepdim=True)
+    count = torch.sum(~torch.isnan(tensor), dim=dim, keepdim=True)
+    correction = count / (count - 1)
+    correction = torch.where(count > 1, correction, torch.full_like(correction, float('nan')))
+    variance *= correction  # Bessel's correction
+    std = torch.sqrt(variance)
+    if keepdim:
+        return std
+    if dim is None:
+        return std.squeeze()
+    if isinstance(dim, int):
+        return std.squeeze(dim)
+    dims = [(d if d >= 0 else d + std.ndim) for d in dim]
+    for d in sorted(dims, reverse=True):
+        std = std.squeeze(d)
+    return std
 
 
 def _find_local_mac() -> str:
@@ -32,6 +65,8 @@ def _find_local_mac() -> str:
 def synchronize(device: Union[torch.device, str, int, None] = None):
     if is_torch_npu_available():
         torch.npu.synchronize(device)
+    elif is_torch_musa_available():
+        torch.musa.synchronize(device)
     elif is_torch_cuda_available():
         torch.cuda.synchronize(device)
     else:
@@ -91,6 +126,8 @@ def get_device(local_rank: Optional[Union[str, int]] = None) -> str:
     local_rank = str(local_rank)
     if is_torch_npu_available():
         device = 'npu:{}'.format(local_rank)
+    elif is_torch_musa_available():
+        device = 'musa:{}'.format(local_rank)
     elif is_torch_mps_available():
         device = 'mps:{}'.format(local_rank)
     elif is_torch_cuda_available():
@@ -104,6 +141,8 @@ def get_device(local_rank: Optional[Union[str, int]] = None) -> str:
 def get_current_device():
     if is_torch_npu_available():
         current_device = torch.npu.current_device()
+    elif is_torch_musa_available():
+        current_device = torch.musa.current_device()
     elif is_torch_cuda_available():
         current_device = torch.cuda.current_device()
     elif is_torch_mps_available():
@@ -114,7 +153,10 @@ def get_current_device():
 
 
 def get_torch_device():
-    if is_torch_cuda_available():
+    # MUSA goes first: MUSA patches such as megatron-lm-musa-patch make torch.cuda.is_available() return True.
+    if is_torch_musa_available():
+        return torch.musa
+    elif is_torch_cuda_available():
         return torch.cuda
     elif is_torch_npu_available():
         return torch.npu
@@ -129,6 +171,8 @@ def set_device(local_rank: Optional[Union[str, int]] = None):
         local_rank = max(0, get_dist_setting()[1])
     if is_torch_npu_available():
         torch.npu.set_device(local_rank)
+    elif is_torch_musa_available():
+        torch.musa.set_device(local_rank)
     elif is_torch_cuda_available():
         torch.cuda.set_device(local_rank)
 
@@ -136,15 +180,89 @@ def set_device(local_rank: Optional[Union[str, int]] = None):
 def get_device_count() -> int:
     if is_torch_npu_available():
         return torch.npu.device_count()
+    elif is_torch_musa_available():
+        return torch.musa.device_count()
     elif is_torch_cuda_available():
         return torch.cuda.device_count()
     else:
         return 0
 
 
+def is_torch_rocm() -> bool:
+    """True on an AMD ROCm/HIP torch build.
+
+    PyTorch on ROCm exposes devices through the ``torch.cuda.*`` API (hipify), so
+    ``is_torch_cuda_available()`` is True on ROCm too; the distinguishing signal is
+    a non-None ``torch.version.hip``.
+    """
+    return is_torch_cuda_available() and getattr(torch.version, 'hip', None) is not None
+
+
+def get_physical_device_count() -> int:
+    """Number of physical accelerators, ignoring ``*_VISIBLE_DEVICES`` masks.
+
+    Unlike :func:`get_device_count` (which honors CUDA/HIP_VISIBLE_DEVICES via the
+    runtime), this queries the driver/topology layer, so a process that inherited a
+    restricted mask can still discover the full device set. It still respects the
+    container's device exposure (``--gpus`` / ``NVIDIA_VISIBLE_DEVICES`` / passed
+    ``/dev/dri`` + ``/dev/kfd``). Falls back to the mask-dependent runtime count if
+    the driver query is unavailable.
+    """
+    import glob
+
+    if is_torch_rocm():
+        # ROCm: the kfd topology lists one node per device; GPU nodes have
+        # ``simd_count > 0`` (CPU/host nodes have 0). Reading sysfs neither
+        # initializes HIP nor is affected by the visibility mask.
+        count = 0
+        for prop in glob.glob('/sys/class/kfd/kfd/topology/nodes/*/properties'):
+            try:
+                with open(prop) as f:
+                    for line in f:
+                        if line.startswith('simd_count'):
+                            if int(line.split()[1]) > 0:
+                                count += 1
+                            break
+            except Exception:
+                continue
+        if count > 0:
+            return count
+    elif is_torch_cuda_available():
+        # NVIDIA: NVML/procfs/nvidia-smi enumerate at the driver level and are not
+        # filtered by CUDA_VISIBLE_DEVICES (only by container-level exposure).
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            try:
+                count = pynvml.nvmlDeviceGetCount()
+            finally:
+                pynvml.nvmlShutdown()
+            if count > 0:
+                return count
+        except Exception:
+            pass
+        count = len(glob.glob('/proc/driver/nvidia/gpus/*'))
+        if count > 0:
+            return count
+        try:
+            import subprocess
+            out = subprocess.check_output(['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
+                                          stderr=subprocess.DEVNULL,
+                                          timeout=5)
+            count = len([line for line in out.decode().splitlines() if line.strip()])
+            if count > 0:
+                return count
+        except Exception:
+            pass
+
+    return get_device_count()
+
+
 def empty_cache():
     if is_torch_npu_available():
         torch.npu.empty_cache()
+    elif is_torch_musa_available():
+        torch.musa.empty_cache()
     elif is_torch_mps_available():
         torch.mps.empty_cache()
     elif is_torch_cuda_available():
@@ -152,7 +270,10 @@ def empty_cache():
 
 
 def ipc_collect():
-    if is_torch_cuda_available():
+    # MUSA goes first, see `get_torch_device`.
+    if is_torch_musa_available():
+        torch.musa.ipc_collect()
+    elif is_torch_cuda_available():
         torch.cuda.ipc_collect()
     elif is_torch_npu_available():
         torch.npu.ipc_collect()
@@ -239,6 +360,8 @@ def init_process_group(backend: Optional[str] = None, timeout: int = 18000000):
     if backend is None:
         if is_torch_npu_available():
             backend = 'hccl'
+        elif is_torch_musa_available():
+            backend = 'mccl'
         elif torch.cuda.is_available():
             backend = 'nccl'
         else:
@@ -314,4 +437,4 @@ def get_max_reserved_memory() -> float:
         mems = [get_torch_device().max_memory_reserved(device=device) for device in devices]
     except AttributeError:
         return 0  # fix mps
-    return sum(mems) / 1024**3
+    return max(mems) / 1024**3

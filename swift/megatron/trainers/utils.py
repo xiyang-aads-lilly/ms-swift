@@ -3,6 +3,7 @@ import gc
 import torch
 from accelerate.utils import gather as hf_gather
 from accelerate.utils import gather_object as hf_gather_object
+from contextlib import nullcontext
 from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -10,6 +11,7 @@ from megatron.core.optimizer import ChainedOptimizer
 from typing import Any, Optional
 
 from swift.dataloader import DataLoaderDispatcher
+from swift.megatron.utils import get_batch_on_this_cp_rank, get_packed_seq_params
 from swift.utils import empty_cache, get_current_device, get_logger, to_device
 
 logger = get_logger()
@@ -26,7 +28,8 @@ def get_batch_on_this_pp_rank(args, data, vp_stage=None):
     is_pp_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
     if not is_pp_last_stage:
         batch['labels'] = None
-        batch['loss_scale'] = None
+        if 'loss_scale' in batch:
+            batch['loss_scale'] = None
 
     return batch
 
@@ -310,7 +313,7 @@ class TrainerState:
     should_log: bool = False
 
     iteration: int = 0
-    consumed_train_samples = 0
+    consumed_train_samples: int = 0
     # compat transformers
     max_steps: Optional[int] = None
 
@@ -332,6 +335,10 @@ class MegatronDataLoaderDispatcher(DataLoaderDispatcher):
 
 
 def build_streaming_dataloader(args, dataset, collate_fn):
+    dataloader_kwargs = {}
+    mp_context = getattr(args, 'dataloader_multiprocessing_context', None)
+    if mp_context is not None and args.dataloader_num_workers > 0:
+        dataloader_kwargs['multiprocessing_context'] = mp_context
     base_dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=args.dataloader_num_workers,
@@ -340,5 +347,184 @@ def build_streaming_dataloader(args, dataset, collate_fn):
         batch_size=args.micro_batch_size,
         prefetch_factor=args.dataloader_prefetch_factor if args.dataloader_num_workers > 0 else None,
         persistent_workers=args.dataloader_persistent_workers if args.dataloader_num_workers > 0 else False,
+        **dataloader_kwargs,
     )
     return MegatronDataLoaderDispatcher(base_dataloader)
+
+
+_NPU_ATTENTION_MASK_2D_MODEL_TYPES = {'qwen3_5', 'qwen3_5_moe'}
+
+
+def _should_use_npu_generated_attention_mask(args) -> bool:
+    from transformers.utils import is_torch_npu_available
+    if not is_torch_npu_available():
+        return False
+    if args.task_type != 'causal_lm' or args.padding_free:
+        return False
+    if getattr(args, 'attention_backend', None) == 'local':
+        return False
+    return bool(getattr(args, 'use_flash_attn', False))
+
+
+def _prepare_npu_generated_attention_mask(batch, *, keep_attention_mask_2d: bool) -> None:
+    if keep_attention_mask_2d:
+        attention_mask = batch.get('attention_mask')
+        if 'attention_mask_2d' not in batch and attention_mask is not None:
+            batch['attention_mask_2d'] = (attention_mask == 0).sum(dim=(1, 2)) > 0
+    else:
+        batch.pop('attention_mask_2d', None)
+    batch['attention_mask'] = None
+
+
+def prepare_batch(args, data, vp_stage=None):
+    """Prepare a micro-batch for Megatron forward: PP slicing, packed_seq_params, CP slicing.
+
+    Extracted from BaseMegatronTrainer._prepare_batch for reuse in ray workers.
+    """
+    batch = get_batch_on_this_pp_rank(args, data, vp_stage=vp_stage)
+    seq_lens = batch.pop('seq_lens', None)
+    # Consider compatibility and security.
+    num_samples = batch.pop('num_samples', None)
+    if seq_lens is not None:
+        if num_samples is not None:
+            assert num_samples == len(seq_lens), (
+                f"'num_samples' ({num_samples}) is inconsistent with len(seq_lens) ({len(seq_lens)}).")
+        num_samples = len(seq_lens)
+    text_position_ids = batch.pop('text_position_ids', None)
+    if text_position_ids is None:
+        text_position_ids = batch.get('position_ids')
+    if _should_use_npu_generated_attention_mask(args):
+        _prepare_npu_generated_attention_mask(
+            batch, keep_attention_mask_2d=getattr(args, 'model_type', None) in _NPU_ATTENTION_MASK_2D_MODEL_TYPES)
+    else:
+        batch.pop('attention_mask_2d', None)
+    if args.padding_free and text_position_ids is not None:
+        batch['packed_seq_params'] = get_packed_seq_params(args, text_position_ids)
+        if seq_lens is not None:
+            batch['packed_seq_params'].seq_lens = torch.tensor(seq_lens, device=text_position_ids.device)
+        if num_samples is not None:
+            batch['packed_seq_params'].num_samples = num_samples
+    batch.setdefault('attention_mask', None)
+    batch = get_batch_on_this_cp_rank(args, batch)
+    return batch
+
+
+def compute_per_token_logps_fn(model, args, data_iterator, temperature=1.0, no_grad=True, enable_routing_replay=False):
+    """Forward pass → logits → temperature-scaled per-token logps.
+
+    Returns:
+        (per_token_logps, routing_topk_idx) — either may be None on non-last PP stages.
+    """
+    from swift.megatron.utils import (RouterReplayHelper, forward_step_helper, get_local_topk_idx_for_current_rank,
+                                      get_router_replay_data, set_router_replay_data)
+    from .vocab_parallel_utils import compute_logps_and_entropy_from_logits
+
+    data = prepare_batch(args, next(data_iterator))
+    data.pop('loss_scale', None)
+    labels = data.get('labels')
+
+    routing_topk_idx = None
+    global_topk_idx = data.pop('routed_experts', None)
+    if enable_routing_replay and RouterReplayHelper.is_replay_forward_action(model.config):
+        assert global_topk_idx is not None, 'When router_replay_mode = R3, routed_experts must be in data'
+        routing_topk_idx = get_local_topk_idx_for_current_rank(
+            global_topk_idx,
+            model.config,
+            data.get('packed_seq_params'),
+            cp_partition_mode=getattr(args, 'cp_partition_mode', 'zigzag'))
+        set_router_replay_data(routing_topk_idx, model.config)
+
+    data_for_forward = {k: v for k, v in data.items() if k != 'labels'}
+    context = torch.no_grad() if no_grad else nullcontext()
+    is_training = model.training
+    if is_training:
+        model.eval()
+    try:
+        with context:
+            output_tensor = forward_step_helper(model, data_for_forward)
+    finally:
+        if is_training:
+            model.train()
+
+    if enable_routing_replay and RouterReplayHelper.is_r2_record_action(model.config):
+        routing_topk_idx = get_router_replay_data(model.config)
+
+    if labels is None or output_tensor is None:
+        return None, routing_topk_idx
+
+    if temperature != 1.0:
+        output_tensor.div_(temperature)
+    per_token_logps, _ = compute_logps_and_entropy_from_logits(output_tensor, labels)
+
+    packed_seq_params = data.get('packed_seq_params')
+    if packed_seq_params is not None:
+        num_samples = packed_seq_params.seq_lens.shape[0]
+    else:
+        input_ids = data.get('input_ids')
+        num_samples = input_ids.shape[0] if input_ids is not None else labels.shape[0]
+
+    if args.context_parallel_size > 1:
+        per_token_logps = reconstruct_tensor_cp(args.context_parallel_size, per_token_logps, packed_seq_params,
+                                                num_samples, args.cp_partition_mode)
+    return per_token_logps, routing_topk_idx
+
+
+def reconstruct_tensor_cp(cp_size, tensor, packed_seq_params, num_samples, cp_partition_mode='zigzag'):
+    """In CP mode, all_gather and reconstruct full tensor sequences."""
+    cp_rank = mpu.get_context_parallel_rank()
+
+    # All-gather across CP ranks
+    output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+    torch.distributed.all_gather(output_list, tensor.contiguous(), group=mpu.get_context_parallel_group())
+    output_list[cp_rank] = tensor
+
+    if cp_partition_mode == 'contiguous':
+        # Contiguous CP splits the entire flattened packed sequence across ranks.
+        output_full = torch.cat(output_list, dim=1)
+        if packed_seq_params is not None:
+            output_full = output_full[:, :packed_seq_params.cu_seqlens_q[num_samples].item()]
+        return output_full
+
+    if packed_seq_params is not None:
+        cu_seqlens_full = packed_seq_params.cu_seqlens_q[:num_samples + 1]
+        total_packed_len = cu_seqlens_full[num_samples].item()
+        cu_seqlens_full = cu_seqlens_full.to(device=tensor.device)
+        starts = cu_seqlens_full[:-1, None]
+        half_chunks = (cu_seqlens_full[1:, None] - starts) // (2 * cp_size)
+        chunks = torch.arange(2 * cp_size, device=tensor.device)
+
+        # Each sequence has 2 * cp_size chunks; rank j owns chunks j and 2 * cp_size - j - 1.
+        ranks = torch.where(chunks < cp_size, chunks, 2 * cp_size - chunks - 1)
+        source_starts = ranks * tensor.shape[1] + starts // cp_size + (chunks >= cp_size) * half_chunks
+        output_starts = starts + chunks * half_chunks
+        repeats = half_chunks.expand(-1, 2 * cp_size).reshape(-1)
+        # Supplying output_size avoids synchronizing to read the sum of the device-side repeats.
+        indices = torch.repeat_interleave(
+            (source_starts - output_starts).reshape(-1), repeats, output_size=total_packed_len)
+        indices += torch.arange(total_packed_len, device=tensor.device)
+        output_full = torch.cat(output_list, dim=1)[:1].index_select(1, indices)
+    else:
+        # non-padding_free mode: [batch_size, seq_len/cp_size] -> [batch_size, seq_len]
+        # Each CP rank has chunks split with load-balanced pattern (2*cp_size chunks)
+        batch_size = tensor.shape[0]
+        seq_len_per_cp = tensor.shape[1]
+        full_seq_len = seq_len_per_cp * cp_size
+        output_full = tensor.new_zeros(batch_size, full_seq_len)
+
+        # Each CP rank j holds chunks j and (2*cp_size - j - 1) from the original 2*cp_size split
+        # Reconstruct the full sequence by placing chunks back in correct positions
+        chunk_len = full_seq_len // (2 * cp_size)
+
+        for j in range(cp_size):
+            o = output_list[j]
+            # This rank holds 2 chunks: chunk j and chunk (2*cp_size - j - 1)
+            half_len = seq_len_per_cp // 2
+            o0 = o[:, :half_len]
+            o1 = o[:, half_len:]
+
+            # Place chunk j at position j * chunk_len
+            output_full[:, j * chunk_len:(j + 1) * chunk_len] = o0
+            reverse_idx = 2 * cp_size - j - 1
+            output_full[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o1
+
+    return output_full

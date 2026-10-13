@@ -8,6 +8,7 @@ from torch import nn
 from transformers.models.qwen2 import modeling_qwen2
 from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3_moe import modeling_qwen3_moe
+from transformers.models.qwen3_vl import modeling_qwen3_vl
 from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
 
 from swift.utils.logger import get_logger
@@ -207,6 +208,16 @@ QWEN3_PATCHES = {
 }
 
 # ---------------------------------------------------------------------------
+# Qwen3-VL dense patch
+# ---------------------------------------------------------------------------
+
+QWEN3_VL_PATCHES = {
+    'Qwen3VLTextRMSNorm': NpuRMSNorm,
+    'apply_rotary_pos_emb': npu_apply_rotary_pos_emb,
+    'Qwen3VLTextMLP.forward': npu_swiglu_forward,
+}
+
+# ---------------------------------------------------------------------------
 # Qwen3.5 dense patch
 # ---------------------------------------------------------------------------
 
@@ -243,45 +254,37 @@ def npu_apply_rotary_pos_emb_qwen3_5(q, k, cos, sin, position_ids=None, unsqueez
     return q_embed, k_embed
 
 
-def _patch_transformers_flash_linear_attention_available() -> None:
-
-    def _is_flash_linear_attention_available() -> bool:
-        return True
-
-    transformers_utils = import_optional_module('transformers.utils')
-    if transformers_utils is not None:
-        setattr(transformers_utils, 'is_flash_linear_attention_available', _is_flash_linear_attention_available)
-
-    transformers_import_utils = import_optional_module('transformers.utils.import_utils')
-    if transformers_import_utils is not None:
-        setattr(transformers_import_utils, 'is_flash_linear_attention_available', _is_flash_linear_attention_available)
+_TRANSFORMERS_FLA_PROBE_MODULES = ('transformers.utils', 'transformers.utils.import_utils')
 
 
-def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
+def _is_flash_linear_attention_importable_on_npu() -> bool:
     try:
-        from ..chunk_gated_delta_rule import chunk_gated_delta_rule
-    except ImportError as exc:
-        logger.warning('Failed to import embedded MindSpeed chunk_gated_delta_rule: %s', exc)
-        return
+        from fla.modules.convolution import causal_conv1d  # noqa: F401
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # noqa: F401
+        return True
+    except Exception:
+        return False
 
-    patched_modules = []
-    for module_name in ('transformers.models.qwen3_5.modeling_qwen3_5',
-                        'transformers.models.qwen3_5_moe.modeling_qwen3_5_moe'):
+
+def _patch_transformers_flash_linear_attention_available_for_npu() -> None:
+    for module_name in _TRANSFORMERS_FLA_PROBE_MODULES:
         module = import_optional_module(module_name)
         if module is None:
             continue
+        original = getattr(module, 'is_flash_linear_attention_available', None)
+        if getattr(original, '_ms_swift_npu_patched', False):
+            continue
 
-        setattr(module, 'is_flash_linear_attention_available', lambda: True)
-        setattr(module, 'is_fast_path_available', True)
-        # FLA's fused RMSNormGated initializes with torch.cuda.current_device(),
-        # so keep the native Qwen3.5 torch implementation on NPU.
-        setattr(module, 'FusedRMSNormGated', None)
-        setattr(module, 'chunk_gated_delta_rule', chunk_gated_delta_rule)
-        patched_modules.append(module_name)
+        def _is_flash_linear_attention_available(_original=original) -> bool:
+            try:
+                if callable(_original) and _original():
+                    return True
+            except Exception:
+                pass
+            return _is_flash_linear_attention_importable_on_npu()
 
-    if patched_modules:
-        logger.info('Patched Qwen3.5 chunk_gated_delta_rule to embedded MindSpeed implementation: %s.',
-                    ', '.join(patched_modules))
+        _is_flash_linear_attention_available._ms_swift_npu_patched = True
+        setattr(module, 'is_flash_linear_attention_available', _is_flash_linear_attention_available)
 
 
 QWEN3_5_PATCHES = {
@@ -509,15 +512,21 @@ def apply_patch() -> None:
     patch_groups = [
         ('qwen2', modeling_qwen2, QWEN2_PATCHES, {}),
         ('qwen3', modeling_qwen3, QWEN3_PATCHES, {}),
+        ('qwen3_vl', modeling_qwen3_vl, QWEN3_VL_PATCHES, {}),
         ('qwen3_moe', modeling_qwen3_moe, QWEN3_MOE_PATCHES, QWEN3_MOE_TRANSFORMERS_5_PATCHES),
         ('qwen3_vl_moe', modeling_qwen3_vl_moe, QWEN3_VL_MOE_PATCHES, {}),
     ]
 
+    _patch_transformers_flash_linear_attention_available_for_npu()
+
     modeling_qwen3_5 = import_optional_module('transformers.models.qwen3_5.modeling_qwen3_5')
     modeling_qwen3_5_moe = import_optional_module('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe')
-    if modeling_qwen3_5 is not None:
-        _patch_transformers_flash_linear_attention_available()
-        patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed()
+
+    # Transformers initializes FLA's fused norm with torch.cuda.current_device().
+    # Keep only that operation on the native Qwen3.5 path; GDN comes from FLA.
+    for module in (modeling_qwen3_5, modeling_qwen3_5_moe):
+        if module is not None:
+            setattr(module, 'FusedRMSNormGated', None)
 
     if modeling_qwen3_5 is not None:
         patch_groups.append(('qwen3_5', modeling_qwen3_5, QWEN3_5_PATCHES, {}))

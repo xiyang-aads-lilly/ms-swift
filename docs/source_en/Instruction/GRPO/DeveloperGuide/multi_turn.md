@@ -4,6 +4,8 @@ In reinforcement-learning scenarios, the model may need to interact with the env
 This interactive training requires the model to carry out continuous reasoning based on the feedback from the environment.
 This document explains in detail how to customise the multi-turn training workflow in GRPO training.
 
+> GKD also supports multi-turn training, sharing the same `MultiTurnScheduler` infrastructure as GRPO.
+
 The figure below shows a typical multi-turn training process, where the model may perform several rollout rounds that include environment interaction, tool calls, and so on:
 
 ![Multi-turn example](../../../../resources/grpo_multi_turn.png)
@@ -26,6 +28,29 @@ class MultiTurnScheduler(ABC):
 
     def __init__(self, max_turns: Optional[int] = None, *args, **kwargs):
         self.max_turns = max_turns
+
+    def on_trajectory_start(self, requests: List['RolloutInferRequest']) -> None:
+        """Called before the first inference turn to initialize trajectory-level state.
+
+        This method can directly modify requests (e.g., inject initial environment observation).
+        Default is no-op.
+        """
+        pass
+
+    def on_turn_end(self, infer_request: 'RolloutInferRequest',
+                    response_choice: 'ChatCompletionResponseChoice',
+                    current_turn: int) -> Dict[str, Any]:
+        """Called after the assistant message is appended and before check_finished.
+
+        Used to advance the environment state (e.g., env.step) and return per-turn metadata.
+
+        Returns:
+            Dict[str, Any]: may optionally contain:
+                - 'done' (bool): if present, overrides the result of check_finished
+                - 'rollout_infos' (dict): merged into the accumulated trajectory info
+        Default returns an empty dict (no-op).
+        """
+        return {}
 
     def step(self, infer_request: 'RolloutInferRequest', response_choice: 'ChatCompletionResponseChoice',
              current_turn: int) -> Dict:
@@ -129,7 +154,7 @@ Specify the scheduler via `multi_turn_scheduler` in the `swift rollout` command:
 ```bash
 swift rollout \
     --model Qwen/Qwen3-1.7B \
-    --use_async_engine true \
+    --vllm_use_async_engine true \
     --multi_turn_scheduler thinking_tips_scheduler \
     --vllm_max_model_len 32768 \
     --vllm_gpu_memory_utilization 0.8 \
@@ -146,21 +171,55 @@ AsyncEngine reduces compute bubbles in multi-turn inference:
 
 <img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/asyncengine.png" width="400" />
 
-Use the `use_async_engine` argument in the `rollout` command to specify the engine type (async is the default).
+Use the `vllm_use_async_engine` argument in the `rollout` command to specify the engine type (async is the default).
 
-> Note: The async engine and the custom multi-turn interaction logic below are currently only supported in server mode. For multi-turn interaction logic in colocate mode, please refer to the _colocate_multi_turn_infer method in RolloutTrainerMixin.
+> Note: The async engine is only available in server mode.
+
+### GYM environment training
+
+If your multi-turn task can be modeled as a standard gym environment (`reset` / `step` / reward produced by the env directly), use the built-in `gym_scheduler` and implement an `Env` subclass to describe the task.
+
+`GYMScheduler` is based on the generic hook protocol and does not require overriding the `run` method:
+- **`on_trajectory_start`**: calls `env.reset` and injects the initial observation into the first user message
+- **`on_turn_end`**: calls `env.step` to advance the environment, returns `{'done': bool, 'rollout_infos': dict}`
+
+This design makes `GYMScheduler` compatible with both server mode (`run()`) and colocate mode (`run_multi_turn()`) — users only need to implement the `Env` interface.
+
+See the [GYM environment training doc](./gym_env.md) for the full interface, the steps to define a custom env, and a minimal end-to-end example with no external dependencies (FrozenLake — runs out of the box on Megatron in colocate mode).
 
 ## Advanced topics
 
 ### Customising the interaction logic
 
 In the default logic we treat the whole multi-turn rollout as one trajectory when computing the loss.
-This assumes the model’s history is not modified during interaction.
+This assumes the model's history is not modified during interaction.
 
 In some scenarios you may need to dynamically change the history during rollout (e.g., compressing context).
 In that case each turn should be treated as a separate trajectory.
 
-A common scenario is for “thinking” models: during real inference the model keeps only the last reasoning step and discards previous ones.
+#### Approach 1: Using hooks
+
+```python
+class CustomScheduler(MultiTurnScheduler):
+    def on_trajectory_start(self, requests):
+        # Initialise before the first turn (e.g., env.reset, inject initial state)
+        for req in requests:
+            req.messages = [system_msg, user_msg(initial_observation)]
+
+    def on_turn_end(self, req, response_choice, current_turn):
+        # Advance state after each turn, return done and rollout_infos
+        next_obs, reward, done = self.advance_env(req.messages)
+        return {
+            'done': done,
+            'rollout_infos': {'reward': reward, ...}
+        }
+```
+
+This approach works with both server mode and colocate mode, and does not require overriding the `run` method.
+
+#### Approach 2: Overriding the `run` method (fully custom)
+
+A common scenario is for "thinking" models: during real inference the model keeps only the last reasoning step and discards previous ones.
 
 For such cases override the `run` method in your scheduler to return the result for each rollout turn individually.
 The built-in `ThinkingModelTipsScheduler` shows how to fully customise multi-turn inference by overriding `run()`.

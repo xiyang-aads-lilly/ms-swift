@@ -46,18 +46,26 @@ class RLHFMegatronArgumentsMixin:
     teacher_model: Optional[str] = field(default=None)
     teacher_model_type: Optional[str] = field(default=None)
     teacher_model_revision: Optional[str] = field(default=None)
+    _teacher_use_disable_adapter: bool = False
     teacher_model_server: Optional[str] = field(
         default=None,
         metadata={
             'help':
             'URL of the teacher model server (e.g., http://localhost:8000). '
-            'When set, teacher logprobs are fetched via API instead of loading a local model.'
+            'When set, teacher logprobs are fetched via API instead of loading a local model. '
+            'Supports multi-teacher via JSON.'
         })
+    teacher_tag_key: str = field(
+        default='dataset', metadata={'help': 'Column name for multi-teacher routing. Default "dataset".'})
     gkd_logits_topk: Optional[int] = None
     lmbda: float = 0.5  # On-policy probability: with prob lmbda, use student-generated responses
-    seq_kd: bool = False  # Sequential KD: use teacher-generated responses when not on-policy
+    seq_kd: bool = False  # Deprecated
     offload_teacher_model: bool = False  # Offload teacher model to CPU to save GPU memory
     sft_alpha: float = 0.0  # Weight for SFT loss in GKD (0 = pure JSD, >0 = JSD + sft_alpha * SFT)
+
+    # OPD-RL (On-Policy Distillation as RL): a teacher (teacher_model / teacher_model_server)
+    # on a GRPO run turns it into OPD-RL, injecting teacher KL as the advantage.
+    teacher_kl_coef: float = 1.0
 
     # grpo/gkd
     temperature: float = 0.9  # Temperature for sampling and loss computation
@@ -141,11 +149,11 @@ class RLHFMegatronArgumentsMixin:
 
     # Dr. GRPO, https://arxiv.org/abs/2503.20783
     # GDPO: normalize each reward function separately
-    scale_rewards: Literal['none', 'group', 'batch', 'gdpo'] = 'group'
+    scale_rewards: Optional[Literal['none', 'group', 'batch', 'gdpo']] = None
 
     # RLOO / REINFORCE++
     advantage_estimator: Literal['grpo', 'rloo', 'reinforce_plus_plus'] = 'grpo'
-    kl_in_reward: bool = False
+    kl_in_reward: Optional[bool] = None
 
     wandb_log_unique_prompts: Optional[bool] = None
     log_completions: bool = False
@@ -186,6 +194,8 @@ class RLHFMegatronArgumentsMixin:
     max_turns: Optional[int] = None
     completion_length_limit_scope: Literal['total', 'per_round'] = 'per_round'
     vllm_server_pass_dataset: bool = False
+    use_gym_env: Optional[bool] = None
+    gym_env: Optional[str] = None
 
     num_iterations: int = 1
 
@@ -216,40 +226,36 @@ class RLHFMegatronArgumentsMixin:
                 self.cosine_max_len = self.max_completion_length
             if self.vllm_limit_mm_per_prompt is not None:
                 self.vllm_limit_mm_per_prompt = json_parse_to_dict(self.vllm_limit_mm_per_prompt)
+        # Teacher setup is identical for GKD and GRPO (OPD-RL): a teacher_model / server /
+        # same-model LoRA self-distillation all flow through the same detection. GKD also
+        # allows dynamic self-distillation (no teacher at all); GRPO without a teacher is
+        # plain RL, so only resolve a teacher for GRPO when one is configured.
+        if self.rlhf_type == 'gkd' or (self.rlhf_type == 'grpo' and
+                                       (self.teacher_model is not None or self.teacher_model_server is not None)):
+            self._check_teacher()
+            if self.rlhf_type == 'grpo':
+                self._check_opd_rl()
         if self.rlhf_type == 'gkd':
-            if self.teacher_model is not None and self.teacher_model_server is not None:
-                raise ValueError('GKD requires either `teacher_model` or `teacher_model_server` to be set, not both.')
-
-            # Self-distillation: teacher_model == student model
-            self._teacher_use_disable_adapter = False
-            if self.teacher_model is not None and self.teacher_model == self.model:
-                if self.tuner_type == 'lora':
-                    logger.info(
-                        'LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
-                    self._teacher_use_disable_adapter = True
-                    self.teacher_model = None
-                else:
-                    # Full training + same teacher_model: a separate frozen copy will be loaded as fixed teacher.
-                    pass
-
-            # Self-distillation: no teacher_model → dynamic teacher (current student weights)
-            if self.teacher_model is None and self.teacher_model_server is None:
-                logger.info('No teacher_model specified. Using self-distillation mode (teacher = student).')
-
-            # When using teacher_model_server, gkd_logits_topk is required (API only returns top-k logprobs)
-            if self.teacher_model_server is not None:
-                if self.gkd_logits_topk is None:
-                    raise ValueError('gkd_logits_topk is required when using teacher_model_server')
+            # GKD-specific: the API path only returns top-k logprobs, so gkd_logits_topk is required.
+            if self.teacher_model_server is not None and self.gkd_logits_topk is None:
+                raise ValueError('gkd_logits_topk is required when using teacher_model_server')
 
             # Validate gkd_logits_topk
             if self.gkd_logits_topk is not None and self.gkd_logits_topk <= 0:
                 raise ValueError(f'gkd_logits_topk must be a positive integer, got {self.gkd_logits_topk}')
+
+            # seq_kd (teacher-generated responses) is not implemented; raise early.
+            if self.seq_kd:
+                raise NotImplementedError('seq_kd=True (Sequential KD with teacher generation) is not supported.')
 
             self.num_generations = 1
             self._init_generation_batch_params()
 
         if self.rlhf_type in ['grpo', 'gkd']:
             self.vllm_engine_kwargs = json_parse_to_dict(self.vllm_engine_kwargs)
+            if self.use_vllm and os.getenv('SWIFT_AUDIO_LOAD_BACKEND') is None:
+                # align with vLLM audio load backend
+                os.environ['SWIFT_AUDIO_LOAD_BACKEND'] = 'soundfile_pyav'
 
     @staticmethod
     def resolve_generation_batch_size(
@@ -334,6 +340,56 @@ class RLHFMegatronArgumentsMixin:
                                              self.micro_batch_size, world_size)
             self.per_device_generation_batch_size = self.generation_batch_size // world_size
 
+    def _check_teacher(self):
+        """Resolve the teacher (shared by GKD and GRPO/OPD-RL).
+
+        Detects the three teacher modes and sets ``_teacher_use_disable_adapter``:
+          - separate teacher_model / teacher_model_server,
+          - same-model LoRA self-distillation (disable_adapter, no extra model),
+          - dynamic self-distillation (no teacher -> teacher == current student weights).
+        """
+        if self.teacher_model is not None and self.teacher_model_server is not None:
+            raise ValueError('setting both `teacher_model` and `teacher_model_server` is not supported.')
+
+        # Fail fast: the Ray pipeline only supports a colocated teacher_model (see
+        # swift/ray/megatron/grpo_trainer.py), so reject teacher_model_server at parse time.
+        if self.use_ray and self.teacher_model_server is not None:
+            raise ValueError('teacher_model_server is not supported with use_ray')
+
+        # Validate teacher_model_server: accept single URL or JSON multi-teacher config.
+        if self.teacher_model_server is not None:
+            from swift.rlhf_trainers.gkd_helpers import parse_teacher_model_server
+            parse_teacher_model_server(self.teacher_model_server)
+
+        self._teacher_use_disable_adapter = False
+        if self.teacher_model is not None and self.teacher_model == self.model:
+            if self.tuner_type == 'lora':
+                logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
+                self._teacher_use_disable_adapter = True
+                self.teacher_model = None
+                self.teacher_model_dir = None
+            # Full training + same teacher_model: a separate frozen copy is loaded as the fixed teacher.
+
+    def _check_opd_rl(self):
+        """Fail-fast OPD-RL (teacher distillation on Megatron GRPO) parameter compatibility.
+
+        Mirrors ``RLHFArguments._check_opd_rl``: the teacher signal is a *per-token* advantage, so
+        features that need a *per-sequence* advantage (sign-based) or reward variance are rejected.
+        Called after ``_init_grpo`` so ``loss_type`` / ``scale_rewards`` are already resolved.
+        """
+        if self.loss_type in ['real', 'fipo']:
+            raise ValueError(f'OPD-RL (teacher) does not support loss_type={self.loss_type!r} '
+                             '(it needs a per-sequence advantage). Use grpo/bnpo/dr_grpo/dapo/cispo/sapo.')
+        if self.off_policy_sequence_mask_delta is not None:
+            raise ValueError('OPD-RL (teacher) does not support off_policy_sequence_mask_delta '
+                             '(it needs a per-sequence advantage).')
+        if not self.reward_funcs:
+            if self.dynamic_sample:
+                raise ValueError('dynamic_sample requires reward_funcs (it filters groups by reward std); '
+                                 'pure OPD-RL distillation has no reward variance.')
+            if self.scale_rewards == 'gdpo':
+                raise ValueError("scale_rewards='gdpo' requires reward_funcs; pure OPD-RL distillation has none.")
+
     def _init_grpo(self):
 
         def _check_not_supported():
@@ -341,8 +397,6 @@ class RLHFMegatronArgumentsMixin:
                 raise ValueError('async_generate is not supported for Megatron GRPO right now')
             if self.sync_ref_model:
                 raise ValueError('sync_ref_model is not supported for Megatron GRPO right now')
-            if self.multi_turn_scheduler:
-                raise ValueError('multi_turn_scheduler is not supported for Megatron GRPO right now')
             if self.num_iterations > 1:
                 raise ValueError('num_iterations > 1 is not supported for Megatron GRPO right now')
 
@@ -369,6 +423,26 @@ class RLHFMegatronArgumentsMixin:
                 f"[REAL] scale_rewards='{self.scale_rewards}' is ignored. "
                 "It will be forced to 'none' because 'loss_type = real' does not support reward normalization.")
 
+        # `kl_in_reward` / `scale_rewards` default to the value tied to `advantage_estimator`.
+        # Mirrors `RLHFArguments._init_grpo` and the Megatron command-line documentation.
+        if self.kl_in_reward is None:
+            if self.advantage_estimator == 'grpo':
+                self.kl_in_reward = False
+            elif self.advantage_estimator in ['rloo', 'reinforce_plus_plus']:
+                self.kl_in_reward = True
+            else:
+                raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
+
+        if self.scale_rewards is None:
+            if self.advantage_estimator == 'grpo':
+                self.scale_rewards = 'group'
+            elif self.advantage_estimator == 'rloo':
+                self.scale_rewards = 'none'
+            elif self.advantage_estimator == 'reinforce_plus_plus':
+                self.scale_rewards = 'batch'
+            else:
+                raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
+
         if self.beta is None:
             self.beta = 0.04  # https://arxiv.org/abs/2402.03300
         if self.async_generate:
@@ -384,6 +458,10 @@ class RLHFMegatronArgumentsMixin:
                 logger.info(f'Auto-configured soft_max_length = max_completion_length {self.max_completion_length}')
         if not self.use_ray:
             assert self.use_vllm, 'use_vllm must be True for Megatron GRPO'
+
+        # Mirror deploy_args: gym_env implies use_gym_env unless the user said otherwise.
+        if self.use_gym_env is None and self.gym_env is not None:
+            self.use_gym_env = True
 
 
 @dataclass
@@ -405,7 +483,7 @@ class MegatronTunerMixin:
 
     # lora
     lora_rank: int = 8
-    lora_alpha: int = 32
+    lora_alpha: float = 32.0
     lora_dropout: float = 0.05
     lora_bias: Literal['none', 'all'] = 'none'
     lora_dtype: Literal['float16', 'bfloat16', 'float32', None] = None
@@ -436,12 +514,13 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     apply_rope_fusion: bool = False
     gradient_accumulation_fusion: bool = True
     cross_entropy_loss_fusion: bool = True
-    cross_entropy_fusion_impl: Optional[Literal['native', 'te']] = None
+    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
     calculate_per_token_loss: Optional[bool] = None
     attention_backend: str = 'flash'  # flash, fused, unfused, local, auto
     optimizer: Literal['adam', 'sgd', 'muon', 'dist_muon'] = 'adam'
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.
+    optimizer_cuda_graph: bool = False
     use_precision_aware_optimizer: bool = False
     main_grads_dtype: Literal['fp32', 'bf16'] = 'fp32'
     main_params_dtype: Literal['fp32', 'fp16'] = 'fp32'
@@ -456,8 +535,9 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     train_dataloader_shuffle: bool = True
     dataloader_num_workers: int = 4
     dataloader_pin_memory: bool = True
-    dataloader_persistent_workers: bool = False
+    dataloader_persistent_workers: bool = True
     dataloader_prefetch_factor: int = 2
+    dataloader_multiprocessing_context: Optional[Literal['fork', 'spawn', 'forkserver']] = None
     data_sharding: bool = False
     group_by_length: bool = False
     te_rng_tracker: bool = False
@@ -493,9 +573,15 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     muon_use_nesterov: bool = False
     muon_scale_mode: Literal['spectral', 'unit_rms_norm', 'shape_scaling'] = 'spectral'
     muon_fp32_matmul_prec: Literal['low', 'medium', 'high'] = 'medium'
+    muon_coefficient_type: str = 'quintic'
     muon_num_ns_steps: int = 5
     muon_tp_mode: Literal['blockwise', 'duplicated', 'distributed'] = 'blockwise'
     muon_extra_scale_factor: float = 1.
+    muon_scalar_optimizer: str = 'adam'
+    # Muon orthogonalizes its updates, so the matrices it manages usually want a larger learning rate than
+    # the scalar optimizer handling the remaining parameters. Both default to `lr`/`min_lr`.
+    muon_lr: Optional[float] = None
+    muon_min_lr: Optional[float] = None
 
     # checkpoint
     output_dir: Optional[str] = None
@@ -524,6 +610,11 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     ddp_timeout: int = 18000000
     ddp_backend: Literal['nccl', 'gloo'] = 'nccl'
     use_distributed_optimizer: bool = True
+    # megatron-fsdp
+    use_megatron_fsdp: bool = False
+    strict_fsdp_dtensor_load: bool = True
+    data_parallel_sharding_strategy: Literal['no_shard', 'optim', 'optim_grads',
+                                             'optim_grads_params'] = 'optim_grads_params'
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     decoder_first_pipeline_num_layers: Optional[int] = None
@@ -531,15 +622,22 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     account_for_embedding_in_pipeline_split: bool = False
     account_for_loss_in_pipeline_split: bool = False
     overlap_p2p_comm: bool = True
+    batch_p2p_comm: Optional[bool] = None
     align_param_gather: bool = True
 
     sequence_parallel: bool = False
     context_parallel_size: int = 1
+    cp_comm_type: Optional[Union[str, List[str]]] = None
+    cp_partition_mode: Literal['zigzag', 'contiguous'] = 'zigzag'
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
     tp_comm_overlap: bool = False
     overlap_grad_reduce: bool = False
     overlap_param_gather: bool = False
     overlap_param_gather_with_optimizer_step: bool = False
     align_grad_reduce: bool = True
+    # Eagerly create NCCL communicators before the training loop to avoid the lazy
+    # first-use allocation hitting the iteration-1 memory peak (Failed to CUDA calloc async).
+    nccl_comm_warmup: bool = False
     virtual_pipeline_model_parallel_size: Optional[int] = None
     microbatch_group_size_per_vp_stage: Optional[int] = None
     pipeline_model_parallel_layout: Optional[str] = None
@@ -586,7 +684,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     moe_enable_deepep: bool = False
     moe_grouped_gemm: bool = True
     moe_permute_fusion: bool = False
-    moe_aux_loss_coeff: float = 0.
+    moe_aux_loss_coeff: List[float] = 0.
     moe_z_loss_coeff: Optional[float] = None
     moe_shared_expert_overlap: bool = False
     moe_layer_recompute: bool = False  # compat mcore 0.12
@@ -594,16 +692,21 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     moe_pad_expert_input_to_capacity: bool = False
     moe_token_drop_policy: Literal['probs', 'position'] = 'probs'
 
+    # engram
+    engram_tokenizer_map: Optional[str] = None
+
     # mtp
     mtp_num_layers: Optional[int] = None
     mtp_loss_scaling_factor: float = 0.1
     mtp_decoder_input_detach: bool = False
     mtp_shared_weights: bool = False
 
-    # mcore-bridge
+    # mcore-bridge / megatron-bridge
+    bridge_backend: Literal['mcore-bridge', 'megatron-bridge'] = 'mcore-bridge'
     model: Optional[str] = None
     model_type: Optional[str] = None
     save_safetensors: bool = True
+    save_missing_weights: bool = False
     adapters: List[str] = field(default_factory=list)
     ref_model: Optional[str] = None
     ref_adapters: List[str] = field(default_factory=list)
@@ -624,6 +727,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     # dsa
     dsa_indexer_loss_coeff: float = 0.
     dsa_indexer_use_sparse_loss: bool = False
+    apply_dsa_kernel_fusion: bool = False
     # deepseek-v4
     csa_dense_mode: bool = False
     use_fused_mhc: bool = False
@@ -631,6 +735,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
 
     # other
     megatron_extra_kwargs: Optional[Union[dict, str]] = None
+    language_model_only: bool = False
     check_model: bool = True
     torch_dtype: Optional[Union[torch.dtype, str]] = None
     rope_scaling: Optional[Union[dict, str]] = None
@@ -642,6 +747,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = None
     num_labels: Optional[int] = None
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None
+    # embedding (Matryoshka Representation Learning)
+    # Dict[int, float], where the key is the embedding dimension and the value is the corresponding loss weight,
+    # e.g. '{"32": 1.0, "64": 1.0, "128": 1.0}'.
+    mrl_dims: Optional[Union[dict, str]] = None
     save_strategy: Literal['steps', 'epoch'] = 'steps'
     callbacks: List[str] = field(default_factory=list)
 
@@ -655,7 +764,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             with open(args_path, 'r', encoding='utf-8') as f:
                 old_args = json.load(f)
             keys = list(f.name for f in fields(MegatronTunerMixin))
-            keys += ['mcore_model', 'task_type', 'num_labels']
+            keys += ['mcore_model', 'task_type', 'num_labels', 'bridge_backend']
             for key in keys:
                 old_value = old_args.get(key)
                 if old_value is not None:
@@ -666,11 +775,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         return res
 
     def _set_default(self):
-        if self.mlp_padding_free:
-            if self.context_parallel_size > 1:
-                require_version(
-                    'mcore-bridge>=1.4.0.dev',
-                    'Please install mcore-bridge>=1.4.0.dev to use mlp_padding_free with context parallel.')
         if self.local_rank is None:
             self.local_rank = get_dist_setting()[1]
         if self.lr is None:
@@ -680,7 +784,11 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
                 self.lr = 1e-4
         if self.task_type is None:
             self.task_type = 'causal_lm'
-        if self.calculate_per_token_loss is None:
+        if self.rlhf_type == 'gkd':
+            if self.calculate_per_token_loss is False:
+                logger.warning("calculate_per_token_loss=False is incompatible with rlhf_type='gkd'; forcing True.")
+            self.calculate_per_token_loss = True
+        elif self.calculate_per_token_loss is None:
             self.calculate_per_token_loss = (self.task_type == 'causal_lm' and self.rlhf_type is None)
 
     def _init_mixed_precision(self):
@@ -691,7 +799,43 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
 
     def _check_mcore_bridge(self):
-        pass
+        if self.language_model_only:
+            if self.tuner_type == 'lora_llm':
+                raise ValueError('`tuner_type="lora_llm"` is not supported when `language_model_only=True`. '
+                                 'Please use `tuner_type="lora"` instead.')
+
+    def _check_bridge_backend(self):
+        """Validate bridge_backend and associated constraints."""
+        if self.bridge_backend == 'megatron-bridge':
+            try:
+                import megatron.bridge
+            except ImportError:
+                raise ImportError('bridge_backend="megatron-bridge" requires the `megatron-bridge` package. '
+                                  'Install it via `pip install megatron-bridge` or use bridge_backend="mcore-bridge".')
+            if self.tuner_type != 'full':
+                raise ValueError('LoRA training is not yet supported with bridge_backend="megatron-bridge". '
+                                 'Please use bridge_backend="mcore-bridge" for LoRA, or set tuner_type="full".')
+        else:
+            require_version('mcore-bridge>=1.5.0', 'Please install mcore-bridge via `pip install mcore-bridge -U`')
+            from swift.megatron.init import _patch_mcore_bridge
+            _patch_mcore_bridge()
+            self._check_mcore_bridge()
+
+    def _check_recompute(self):
+        """Reject the LoRA + selective-recomputation combination for deepseek_v41."""
+        # For deepseek_v41 selective recomputation drives the per-module
+        # CheckpointWithoutOutput path, which discards a submodule output and registers a
+        # recompute backward hook on a downstream tensor (e.g. the attention output). LoRA
+        # inserts adapter autograd nodes that reorder the backward pass so the checkpoint's
+        # own backward frees its saved inputs before that hook fires; recomputation then
+        # crashes reading the freed ctx.saved_tensors. Full-parameter tuning keeps the
+        # expected ordering, so selective is only safe there.
+        if (self.model_type == 'deepseek_v41' and self.tuner_type in ('lora', 'lora_llm')
+                and self.recompute_granularity == 'selective'):
+            raise ValueError('recompute_granularity="selective" is not supported with LoRA for deepseek_v41: '
+                             'the recompute backward hook crashes on the freed activation graph. Use '
+                             '--recompute_granularity full (recommended, largest memory saving) or none, or '
+                             'switch to tuner_type="full" to keep selective recomputation.')
 
     def __post_init__(self):
         if self.tuner_type != 'full':
@@ -699,7 +843,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         RLHFMegatronArgumentsMixin.__post_init__(self)
         MegatronTunerMixin.__post_init__(self)
         os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
-        self._check_mcore_bridge()
+        self._check_bridge_backend()
         if self.recompute_granularity == 'none':
             self.recompute_granularity = None
         if self.recompute_granularity == 'selective' and self.recompute_method is not None:
@@ -711,15 +855,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         self._init_vpp_size()
         if self.vit_gradient_checkpointing is None:
             self.vit_gradient_checkpointing = not self.freeze_vit
-        if self.cross_entropy_fusion_impl is None:
-            if is_torch_npu_available():
-                self.cross_entropy_fusion_impl = 'native'
-            else:
-                import transformer_engine
-                if version.parse(transformer_engine.__version__) >= version.parse('2.8.0'):
-                    self.cross_entropy_fusion_impl = 'te'
-                else:
-                    self.cross_entropy_fusion_impl = 'native'
         if isinstance(self.report_to, str):
             self.report_to = [self.report_to]
         self.model_info, self.model_meta = get_model_info_meta(
@@ -729,12 +864,24 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         self.model_type = self.model_info.model_type
         self.model_dir = self.model_info.model_dir
         self.is_multimodal = self.model_meta.is_multimodal
-        self.megatron_model_meta = get_model_meta(self._get_mcore_model_type(self.model_meta))
-        if self.megatron_model_meta is None:
-            raise ValueError(f'Model: {self.model} is not supported.')
+        self._check_recompute()
+        if self.bridge_backend == 'megatron-bridge':
+            self.megatron_model_meta = None
+            if self.is_multimodal:
+                raise ValueError('Multimodal training is not yet supported with bridge_backend="megatron-bridge". '
+                                 'Please use bridge_backend="mcore-bridge" for multimodal models.')
+            if self.task_type not in (None, 'causal_lm'):
+                raise ValueError(f'task_type={self.task_type!r} is not yet supported with '
+                                 f'bridge_backend="megatron-bridge".')
+        else:
+            self.megatron_model_meta = get_model_meta(self._get_mcore_model_type(self.model_meta))
+            if self.megatron_model_meta is None:
+                raise ValueError(f'Model: {self.model} is not supported.')
         self._init_teacher_model()
-        if self.apply_wd_to_qk_layernorm and self.model_type not in {'qwen3_next', 'qwen3_5', 'qwen3_5_moe'}:
-            raise ValueError('apply_wd_to_qk_layernorm is only supported for qwen3_next, qwen3_5 and qwen3_5_moe')
+        if self.apply_wd_to_qk_layernorm and self.model_type not in {
+                'qwen3_next', 'qwen3_5', 'qwen3_5_moe', 'qwen4_exp'
+        }:
+            raise ValueError(f'apply_wd_to_qk_layernorm is only supported for {self.model_type} ')
         if self.pipeline_model_parallel_size == 1 and (self.decoder_first_pipeline_num_layers is not None
                                                        or self.decoder_last_pipeline_num_layers is not None):
             raise ValueError('pipeline_model_parallel_size must be greater than 1 if you want to set '
@@ -745,6 +892,9 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
 
         if self.megatron_extra_kwargs is not None:
             self.megatron_extra_kwargs = json_parse_to_dict(self.megatron_extra_kwargs)
+        if self.mrl_dims is not None:
+            self.mrl_dims = json_parse_to_dict(self.mrl_dims)
+            self.mrl_dims = {int(k): float(v) for k, v in self.mrl_dims.items()}
         if self.task_type not in {'causal_lm', 'generative_reranker'}:
             self.untie_embeddings_and_output_weights = True
         if self.vit_gradient_checkpointing_kwargs is not None:
@@ -789,15 +939,58 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         self._init_multimodal_full()
         self._map_dtype()
         self._init_weigh_decay()
-        self.attention_backend = AttnBackend[self.attention_backend]
+        self._init_attention_backend()
         if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
             self.sequence_parallel = False
+        if isinstance(self.moe_aux_loss_coeff, list) and len(self.moe_aux_loss_coeff) == 1:
+            self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
+        if isinstance(self.moe_router_load_balancing_type, list) and len(self.moe_router_load_balancing_type) == 1:
+            self.moe_router_load_balancing_type = self.moe_router_load_balancing_type[0]
         if self.tp_comm_overlap and not self.sequence_parallel:
             raise ValueError('Tensor parallel communication/GEMM overlap can happen only when '
                              'sequence parallelism is enabled')
 
+        self._check_megatron_fsdp()
         self._init_distributed()
         self._check_muon()
+
+    def _check_megatron_fsdp(self):
+        if not self.use_megatron_fsdp:
+            return
+        # Megatron-FSDP is only compatible with the distributed optimizer.
+        if not self.use_distributed_optimizer:
+            logger.info('Megatron-FSDP is only compatible with use_distributed_optimizer=True; setting it to True.')
+            self.use_distributed_optimizer = True
+        # Only sgd/adam are supported by Megatron-FSDP.
+        if self.optimizer not in ('sgd', 'adam'):
+            raise ValueError(f'Megatron-FSDP does not support the "{self.optimizer}" optimizer yet.')
+        # FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 (or unset). SWIFT sets it to '1' by default,
+        # so override it here before distributed initialization.
+        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == '1':
+            raise ValueError('Megatron-FSDP requires `CUDA_DEVICE_MAX_CONNECTIONS > 1`, '
+                             'for example you can set `CUDA_DEVICE_MAX_CONNECTIONS=32`')
+
+    def _init_attention_backend(self):
+        if self.attention_backend.startswith('flash_'):
+            from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils as fa_utils
+
+            fa_version = int(self.attention_backend[len('flash_'):])
+            assert fa_version in (2, 3, 4), (f'Unsupported flash attention version: {fa_version}. '
+                                             f'Supported: flash_2, flash_3, flash_4.')
+            available = {2: fa_utils.is_installed, 3: fa_utils.v3_is_installed, 4: fa_utils.v4_is_installed}
+            if not available[fa_version]:
+                raise ValueError(f'flash-attn v{fa_version} is not installed. '
+                                 f'Detected installations: FA2={available[2]}, FA3={available[3]}, FA4={available[4]}.')
+
+            if fa_version != 2:
+                fa_utils.is_installed = False
+            if fa_version != 3:
+                fa_utils.v3_is_installed = False
+            if fa_version != 4:
+                fa_utils.v4_is_installed = False
+            logger.info(f'Forcing Flash Attention v{fa_version} as the attention backend.')
+            self.attention_backend = 'flash'
+        self.attention_backend = AttnBackend[self.attention_backend]
 
     def _init_distributed(self):
         initialize_megatron(self)
@@ -837,6 +1030,54 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
                     'Muon optimizer does not support overlap param gather. Use dist_muon instead.')
             # Muon optimizer does not support distributed optimizer for now.
             self.use_distributed_optimizer = False
+            # compat mcore 0.17
+            self.muon_nesterov = self.muon_use_nesterov
+
+            # `vit_lr`/`aligner_lr` replace mcore's `_get_param_groups`. Where Muon splits the parameters
+            # through `config_overrides`, that replacement drops the split and every parameter, biases
+            # included, ends up in Muon; failing here beats training that silently. The older Muon does the
+            # split by freezing parameters around the call instead, so the replacement is harmless there.
+            incompatible_args = [name for name in ['vit_lr', 'aligner_lr'] if getattr(self, name) is not None]
+            if incompatible_args and self._muon_routes_through_param_overrides():
+                raise ValueError(f'Muon optimizer does not support: {", ".join(incompatible_args)} with '
+                                 f'megatron-core {megatron.core.__version__}. '
+                                 'Use `--muon_lr` to give the Muon-managed matrices their own learning rate.')
+            self._check_muon_mcore_support()
+        elif self.muon_lr is not None or self.muon_min_lr is not None:
+            raise ValueError('`muon_lr`/`muon_min_lr` require `--optimizer muon` or `--optimizer dist_muon`.')
+
+    @staticmethod
+    def _muon_routes_through_param_overrides() -> bool:
+        """Whether the installed mcore splits the parameters between Muon and its scalar optimizer through
+        `config_overrides` rather than by freezing them around `_get_param_groups`.
+
+        `is_managed_by_layer_wise_optimizer` is the predicate that split was expressed as, and it is declared
+        unconditionally, so unlike the override registry it tells the two designs apart without also depending
+        on which `emerging-optimizers` happens to be installed. `BaseMegatronTrainer` resolves the same symbol
+        to key the `muon_lr` override on, falling back to the older inline rule, so the two move together.
+        """
+        try:
+            from megatron.core.optimizer.layer_wise_optimizer import is_managed_by_layer_wise_optimizer  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def _check_muon_mcore_support(self):
+        """Fail on Muon settings the installed megatron-core would drop without a word.
+
+        mcore fills its `OptimizerConfig` from the fields it declares, so a setting it does not know about
+        vanishes silently: on the versions predating `muon_scalar_optimizer`, Muon hardcodes Adam for the
+        parameters it does not manage, and `--muon_scalar_optimizer sgd` would quietly train with Adam.
+        """
+        from megatron.core.optimizer import OptimizerConfig
+        config_fields = {f.name for f in fields(OptimizerConfig)}
+        unsupported = [
+            name for name in ['muon_scalar_optimizer', 'muon_coefficient_type']
+            if name not in config_fields and getattr(self, name) != self.__dataclass_fields__[name].default
+        ]
+        if unsupported:
+            raise ValueError(f'megatron-core {megatron.core.__version__} does not support: '
+                             f'{", ".join(unsupported)}. Leave them at their default or upgrade megatron-core.')
 
     def _init_teacher_model(self):
         if self.teacher_model is None:
@@ -845,9 +1086,12 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.teacher_model, model_type=self.teacher_model_type, use_hf=self.use_hf, hub_token=self.hub_token)
         self.teacher_model_type = self.teacher_model_info.model_type
         self.teacher_model_dir = self.teacher_model_info.model_dir
-        self.teacher_megatron_model_meta = get_model_meta(self._get_mcore_model_type(self.teacher_model_meta))
-        if self.teacher_megatron_model_meta is None:
-            raise ValueError(f'Model: {self.teacher_model} is not supported.')
+        if self.bridge_backend == 'megatron-bridge':
+            self.teacher_megatron_model_meta = None
+        else:
+            self.teacher_megatron_model_meta = get_model_meta(self._get_mcore_model_type(self.teacher_model_meta))
+            if self.teacher_megatron_model_meta is None:
+                raise ValueError(f'Model: {self.teacher_model} is not supported.')
 
     def _init_vpp_size(self):
         if self.pipeline_model_parallel_layout is not None:
@@ -868,6 +1112,8 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         if self.virtual_pipeline_model_parallel_size is None:
             self.overlap_p2p_comm = False
             self.align_param_gather = False
+        if self.batch_p2p_comm is None:
+            self.batch_p2p_comm = not self.overlap_p2p_comm
 
     def _load_adapter_config(self):
         assert len(self.adapters) == 1, 'Currently only support one adapter'
@@ -928,8 +1174,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.eval_iters = 0
 
     def _init_multimodal_full(self):
+        if not self.is_multimodal:
+            return
         visual_cls = self.megatron_model_meta.visual_cls
-        if self.tuner_type == 'full' and self.is_multimodal and visual_cls is not None:
+        if self.tuner_type == 'full' and self.is_multimodal and visual_cls is not None and not self.language_model_only:
             vision_tower = [f'visual.{vit}' for vit in getattr(visual_cls, '_vision_tower', [])]
             aligner = [f'visual.{aligner}' for aligner in getattr(visual_cls, '_aligner', [])]
             generator = [f'visual.{generator}' for generator in getattr(visual_cls, '_generator', [])]

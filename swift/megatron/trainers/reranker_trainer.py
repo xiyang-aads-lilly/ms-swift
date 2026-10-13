@@ -2,6 +2,8 @@
 import torch.nn
 from collections import namedtuple
 from functools import partial
+from megatron.core import mpu
+from megatron.core.utils import get_attr_wrapped_model
 
 from swift.loss import loss_map
 from swift.metrics import eval_metrics_map
@@ -16,13 +18,8 @@ class MegatronRerankerTrainer(BaseMegatronTrainer):
 
     def __init__(self, args, template):
         super().__init__(args, template)
-        if args.context_parallel_size > 1:
-            raise ValueError('Currently `task_type="reranker/generative_reranker"` does not support '
-                             'context parallelism.')
-        if not args.padding_free:
-            raise ValueError('Currently, task_type reranker/generative_reranker only supports padding_free.')
         self._loss_func = loss_map[args.loss_type](args, self)
-        self.eval_metrics = eval_metrics_map['reranker'](args, self)
+        self.eval_metrics = eval_metrics_map['reranker'](args, self, group=mpu.get_data_parallel_group())
 
     @staticmethod
     def _get_listwise_reranker_preds(logits, labels):
@@ -36,9 +33,14 @@ class MegatronRerankerTrainer(BaseMegatronTrainer):
         labels = torch.tensor([0] * (len(positive_indices) - 1), device=preds.device)
         return preds, labels
 
-    def loss_func(self, output_tensor: torch.Tensor, *, labels: torch.Tensor, packed_seq_params=None):
+    def loss_func(self,
+                  output_tensor: torch.Tensor,
+                  *,
+                  labels: torch.Tensor,
+                  packed_seq_params=None,
+                  attention_mask=None):
         training = self.unwrapped_models[0].training
-        logits = self.get_last_tokens(output_tensor, packed_seq_params)
+        logits = self.get_last_tokens(output_tensor, packed_seq_params, attention_mask)
         loss = self._loss_func(ModelOutputs(logits=logits), labels)
         args = self.args
         logits_detach = logits.detach().squeeze(-1)
@@ -60,11 +62,14 @@ class MegatronRerankerTrainer(BaseMegatronTrainer):
             lm_model.tokenizer = self.template.tokenizer
 
     def forward_step(self, data_iterator, model):
-        # Get the batch.
-        vp_stage = model.module.module.vp_stage
+        vp_stage = get_attr_wrapped_model(model, 'vp_stage')
         data = self.get_batch(data_iterator, vp_stage)
         labels = data.pop('labels', None)
         output_tensor = model(**data)
-        packed_seq_params = data.get('packed_seq_params')
-        loss_func = partial(self.loss_func, labels=labels, packed_seq_params=packed_seq_params)
+        loss_func = partial(
+            self.loss_func,
+            labels=labels,
+            packed_seq_params=data.get('packed_seq_params'),
+            attention_mask=data.get('attention_mask')
+            if data.get('attention_mask') is not None else data.get('attention_mask_2d'))
         return output_tensor, loss_func

@@ -7,7 +7,6 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from functools import partial
 from itertools import repeat
 from packaging import version
 from queue import Queue
@@ -88,7 +87,7 @@ class InferStreamer(InferTools):
         raw_tokens = raw_tokens[self.cache_idx:]
         if self.first_token:
             raw_tokens = []
-        response = self.template.decode(
+        response = self.template.decode_generate_ids(
             raw_tokens, is_finished=is_finished, first_token=self.first_token, **self.decode_kwargs)
         response = self._align_blank_suffix(response)
         return self._get_response(response, is_finished, len(raw_tokens))
@@ -151,14 +150,14 @@ def prepare_generation_config(model_generation_config: Optional[GenerationConfig
     for key in ['temperature', 'top_k', 'top_p', 'repetition_penalty', 'num_beams']:
         new_value = getattr(request_config, key)
         if new_value is None:
-            kwargs[key] = getattr(model_generation_config, key)
+            kwargs[key] = getattr(model_generation_config, key, None)
         else:
             kwargs[key] = new_value
 
     if kwargs.get('top_k') is not None and kwargs['top_k'] <= 0:
         kwargs['top_k'] = None
 
-    if not model_generation_config.do_sample and request_config.temperature in {0, None}:
+    if not getattr(model_generation_config, 'do_sample', False) and request_config.temperature in {0, None}:
         kwargs['temperature'] = 0
     if kwargs['temperature'] == 0:
         kwargs['do_sample'] = False
@@ -359,22 +358,17 @@ def patch_lmdeploy(load_weights=False):
     TurboMindInstance._create_model_instance = _create_model_instance
 
 
-def patch_npu_vllm(vllm_device: str):
+def patch_npu_vllm(vllm_device: str, *, colocate: bool = False):
     if isinstance(vllm_device, int):
         vllm_device = get_device(vllm_device)
     device_type = vllm_device.split(':')[0]
+    if device_type == 'npu':
+        from swift.model.npu_patch.vllm_ascend import patch_vllm_ascend_runtime
+        from swift.model.npu_patch.vllm_ascend_memory import vllm_ascend_mem_get_info_context
+        patch_vllm_ascend_runtime(colocate=colocate)
+        return vllm_ascend_mem_get_info_context(vllm_device)
 
-    @contextmanager
-    def new_group_context():
-        original_new_group = torch.distributed.new_group
-        try:
-            torch.distributed.new_group = partial(original_new_group, use_local_synchronization=True)
-            torch.npu.mem_get_info = partial(torch.npu.mem_get_info, device=vllm_device)
-            yield
-        finally:
-            torch.distributed.new_group = original_new_group
-
-    return new_group_context() if device_type == 'npu' else nullcontext()
+    return nullcontext()
 
 
 def patch_vllm_triton_device_guard():

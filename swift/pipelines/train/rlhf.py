@@ -37,8 +37,14 @@ class SwiftRLHF(SwiftSft):
             if task_type == 'seq_cls' and num_labels is None:
                 num_labels = 1
         else:
-            from transformers import AutoConfig
-            model_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+            from transformers import AutoConfig, PretrainedConfig
+            try:
+                model_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+            except Exception:
+                # Some custom model_types (e.g. qwen3_asr) are registered into transformers
+                # only when the corresponding ModelLoader imports its plugin package,
+                # which happens later; fall back to the raw config dict here.
+                model_config = PretrainedConfig.from_dict(PretrainedConfig.get_config_dict(model_dir)[0])
             if hasattr(model_config, 'architectures') and model_config.architectures:
                 if any('sequenceclassification' in arch.lower() for arch in model_config.architectures):
                     task_type = 'seq_cls'
@@ -91,7 +97,12 @@ class SwiftRLHF(SwiftSft):
                 task_type=task_type,
                 num_labels=num_labels)
 
-        adapters = args.adapters if key == 'ref' else args.reward_adapters
+        if key == 'ref':
+            adapters = args.adapters
+        elif key == 'teacher':
+            adapters = args.teacher_adapters
+        else:
+            adapters = args.reward_adapters
         model = prepare_adapter(args, model, adapters)
         if origin_key in {'ref', 'reward', 'teacher'}:
             if self.args.sequence_parallel_size > 1:
@@ -118,7 +129,7 @@ class SwiftRLHF(SwiftSft):
                 continue
             if key == 'value' and args.rlhf_type != 'ppo':
                 continue
-            if key == 'teacher' and args.rlhf_type != 'gkd':
+            if key == 'teacher' and args.rlhf_type not in ['gkd', 'grpo']:
                 continue
             model_key = 'reward' if key == 'value' else key
             model_type = getattr(args, f'{model_key}_model_type')
@@ -232,13 +243,15 @@ class SwiftRLHF(SwiftSft):
             trainer_kwargs['reward_funcs'] = self.args.reward_funcs
             if self.args.chord_sft_dataset:
                 trainer_kwargs['chord_sft_dataset'], _ = self._prepare_chord_sft_dataset()
-        if self.args.rlhf_type == 'gkd':
+        # Teacher wiring shared by GKD and GRPO+OPD-RL (gkd_logits_topk is GKD-only).
+        if self.args.rlhf_type in ['gkd', 'grpo']:
             if self.args.teacher_deepspeed:
                 trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
-            trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk
             if self.args.teacher_model_server:
                 trainer_kwargs['teacher_model_server'] = self.args.teacher_model_server
             trainer_kwargs['teacher_use_disable_adapter'] = getattr(self.args, '_teacher_use_disable_adapter', False)
+        if self.args.rlhf_type == 'gkd':
+            trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk
         return trainer_kwargs
 
 

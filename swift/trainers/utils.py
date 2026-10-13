@@ -4,6 +4,7 @@ import inspect
 import math
 import os
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from contextlib import contextmanager
 from modelscope.hub.api import HubApi
@@ -22,6 +23,104 @@ if TYPE_CHECKING:
     from .arguments import TrainingArguments
 
 logger = get_logger()
+
+
+def accepts_parameter(method, parameter_name: str) -> bool:
+    parameters = inspect.signature(method).parameters
+    if parameter_name in parameters:
+        return True
+    return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+
+
+def check_dlrover_flash_checkpoint_api(checkpointer_cls, checkpoint_engine_cls):
+    """Report up front when the installed DLRover predates the Flash Checkpoint arguments ms-swift uses.
+
+    The trainer adapts its calls to either API, so this only warns: on the older API the final save is not
+    blocking, which the `wait_latest_checkpoint` call at the end of training covers anyway.
+    """
+    optional_parameters = [
+        (checkpointer_cls.save_checkpoint_to_storage, 'blocking'),
+        (checkpoint_engine_cls.wait_latest_checkpoint, 'max_steps'),
+    ]
+    missing_parameters = [name for method, name in optional_parameters if not accepts_parameter(method, name)]
+    if missing_parameters:
+        missing = ', '.join(missing_parameters)
+        logger.warning(f'The installed DLRover Flash Checkpoint API does not accept: {missing}. ms-swift falls '
+                       'back to the legacy calls; install the latest DLRover source to get the newer API: '
+                       '`pip install git+https://github.com/intelligent-machine-learning/dlrover.git`.')
+
+
+def _get_deepspeed_elastic_world_size():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return get_dist_setting()[2]
+
+
+def _enable_load_universal(ds_config):
+    if isinstance(ds_config, dict):
+        checkpoint = ds_config.get('checkpoint')
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+            ds_config['checkpoint'] = checkpoint
+        checkpoint['load_universal'] = True
+
+
+def enable_deepspeed_load_universal(args: 'TrainingArguments', trainer=None):
+    _enable_load_universal(getattr(args, 'deepspeed', None))
+
+    hf_ds_config = getattr(args, 'hf_deepspeed_config', None)
+    _enable_load_universal(getattr(hf_ds_config, 'config', None))
+
+    deepspeed_plugin = getattr(args, 'deepspeed_plugin', None)
+    if trainer is not None and deepspeed_plugin is None:
+        accelerator = getattr(trainer, 'accelerator', None)
+        state = getattr(accelerator, 'state', None)
+        deepspeed_plugin = getattr(state, 'deepspeed_plugin', None)
+    if deepspeed_plugin is not None:
+        _enable_load_universal(getattr(deepspeed_plugin, 'deepspeed_config', None))
+        plugin_hf_ds_config = getattr(deepspeed_plugin, 'hf_ds_config', None)
+        _enable_load_universal(getattr(plugin_hf_ds_config, 'config', None))
+
+
+def prepare_deepspeed_elastic_config(args: 'TrainingArguments', state=None):
+    ds_config = args.deepspeed
+    if not ds_config:
+        return
+    if not isinstance(ds_config, dict):
+        logger.warning('DeepSpeed elastic expects args.deepspeed to be a dict, but got '
+                       f'{type(ds_config).__name__}. Skip elastic config.')
+        return
+
+    from deepspeed.elasticity import compute_elastic_config
+    from deepspeed.git_version_info import version as __version__
+
+    enable_deepspeed_load_universal(args)
+    elasticity = ds_config.get('elasticity') or {}
+    if not elasticity:
+        logger.warning_once('DeepSpeed elastic callback is enabled, but no `elasticity` section is found in '
+                            'the DeepSpeed config. Only `checkpoint.load_universal` is enabled.')
+        return
+    if elasticity.get('enabled') is False:
+        return
+
+    world_size = _get_deepspeed_elastic_world_size()
+    final_batch_size, _, micro_batch_size = compute_elastic_config(
+        ds_config=ds_config,
+        target_deepspeed_version=__version__,
+        world_size=world_size,
+    )
+    if world_size <= 0 or micro_batch_size <= 0:
+        raise ValueError('DeepSpeed elastic config produced invalid batch settings: '
+                         f'world_size={world_size}, micro_batch_size={micro_batch_size}.')
+    gradient_accu_steps = max(1, final_batch_size // (micro_batch_size * world_size))
+    args.per_device_train_batch_size = micro_batch_size
+    args.gradient_accumulation_steps = gradient_accu_steps
+    if state is not None:
+        state.train_batch_size = args.per_device_train_batch_size * max(1, args.n_gpu)
+    logger.info_once('DeepSpeed elastic config is enabled. '
+                     f'world_size: {world_size}, '
+                     f'per_device_train_batch_size: {args.per_device_train_batch_size}, '
+                     f'gradient_accumulation_steps: {args.gradient_accumulation_steps}')
 
 
 def can_return_loss(model: Module) -> bool:
@@ -65,7 +164,7 @@ def is_instance_of_ms_model(model: Module) -> bool:
     return False
 
 
-def per_token_loss_func_sp(outputs, labels, enable_dft_loss=False, **kwargs) -> torch.Tensor:
+def per_token_loss_func_sp(outputs, labels, enable_dft_loss=False, return_labels=False, **kwargs):
     """Common loss function for sequence parallel training"""
     if hasattr(outputs, 'logits'):
         logits = outputs.logits
@@ -93,7 +192,10 @@ def per_token_loss_func_sp(outputs, labels, enable_dft_loss=False, **kwargs) -> 
     if position_ids is not None and position_ids.min() == -1:
         _pos_mask = position_ids >= 0
         loss = loss[_pos_mask].contiguous()
+        labels = labels[_pos_mask].contiguous()
 
+    if return_labels:
+        return loss, labels
     return loss
 
 
@@ -221,6 +323,31 @@ def disable_gradient_checkpointing(model: PreTrainedModel, gradient_checkpointin
     finally:
         if was_enabled:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
+
+def pad_to_global_max_len(tensor: torch.Tensor, global_max_len: int, padding_value: int = 0) -> torch.Tensor:
+    """Pad a [batch, seq_len] tensor on the right to ``global_max_len``."""
+    if tensor.ndim != 2:
+        return tensor
+    pad_len = global_max_len - tensor.shape[1]
+    if pad_len <= 0:
+        return tensor
+    return F.pad(tensor, (0, pad_len), value=padding_value)
+
+
+def get_ddp_global_max_seq_len(local_seq_len: int, device: torch.device) -> int:
+    """Return the max sequence length across all DDP ranks."""
+    if dist.is_available() and dist.is_initialized():
+        max_len = torch.tensor([local_seq_len], device=device, dtype=torch.long)
+        dist.all_reduce(max_len, op=dist.ReduceOp.MAX)
+        return int(max_len.item())
+    return local_seq_len
+
+
+def pad_for_ddp_gather(tensor: torch.Tensor, padding_value: int = 0) -> torch.Tensor:
+    """Pad predictions/labels so every rank shares the same seq length before DDP gather."""
+    global_max_len = get_ddp_global_max_seq_len(tensor.shape[1], tensor.device)
+    return pad_to_global_max_len(tensor, global_max_len, padding_value=padding_value)
 
 
 def gather_for_unpadded_tensors(input_data, use_gather_object=False):

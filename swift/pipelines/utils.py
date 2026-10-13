@@ -28,6 +28,9 @@ def prepare_adapter(args, model, adapters=None):
     adapters = adapters if adapters is not None else args.adapters
     for adapter in adapters:
         model = tuner.from_pretrained(model, adapter)
+        if getattr(args, 'task_type', None) == 'decision':
+            from swift.model.decision_head import maybe_load_trained_scoring_head
+            maybe_load_trained_scoring_head(model, adapter)
     if args.tuner_type == 'bone':
         # Bone has a problem of float32 matmul with bloat16 in `peft==0.14.0`
         model.to(model.dtype)
@@ -52,14 +55,16 @@ def _select_dataset(args, dataset):
         # Compatible with ms-swift 3.x cache_dataset
         dataset = dataset.rename_column('length', 'lengths')
     max_length = args.max_length
-    if args.truncation_strategy == 'delete':
+    new_dataset = dataset
+    if args.truncation_strategy == 'delete' and max_length is not None:
         lengths = dataset['lengths']
-        idxs = [
-            i for i, length in enumerate(lengths) if (max(length) if isinstance(length, list) else length) <= max_length
-        ]
-        new_dataset = dataset.select(idxs)
-    else:
-        new_dataset = dataset
+        if lengths and isinstance(lengths[0], list):
+            arr = np.fromiter((max(length) for length in lengths), dtype=np.int64, count=len(lengths))
+        else:
+            arr = np.asarray(lengths, dtype=np.int64)
+        keep = arr <= max_length
+        if not bool(keep.all()):
+            new_dataset = dataset.select(np.flatnonzero(keep))
     if len(new_dataset) < len(dataset):
         logger.info(f'Dataset filtered, origin length: {len(dataset)}, filtered dataset length: {len(new_dataset)}')
     return new_dataset

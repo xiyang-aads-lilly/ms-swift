@@ -55,19 +55,22 @@ class MegatronExport(SwiftPipeline):
                 mg_model = peft_model.merge_and_unload()
         logger.info('Converting weights and saving the model...')
         save_peft_format = args.tuner_type == 'lora' and not args.merge_lora
+        # `to_hf` may load from a mcore checkpoint, so pass the source HF dir explicitly.
+        save_missing_weights = (args.save_missing_weights and args.model_info is not None and args.model_info.model_dir)
         bridge.save_weights(
             [mg_model],
             args.output_dir,
             peft_format=save_peft_format,
             args=args,
             processor=self.processor,
+            save_missing_weights=save_missing_weights,
         )
-        args_path = os.path.join(args.mcore_adapter or args.mcore_model or args.model, 'args.json')
-        if os.path.exists(args_path):
-            if is_master():
+        if is_master():
+            if args.ckpt_dir:
+                args_path = os.path.join(args.ckpt_dir, 'args.json')
                 shutil.copy(args_path, os.path.join(args.output_dir, 'args.json'))
-        else:
-            args.save_args(args.output_dir)
+            else:
+                args.save_args(args.output_dir)
         if args.test_convert_precision:
             with disable_safe_ddp_context_use_barrier():
                 if save_peft_format:

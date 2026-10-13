@@ -33,7 +33,6 @@ class KTOTrainer(RLHFTrainerMixin, SwiftMixin, HFKTOTrainer):
         self.desirable_weight = args.desirable_weight
         self.undesirable_weight = args.undesirable_weight
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
-        self.is_peft_model = isinstance(model, PeftModel)
         if hasattr(args, 'loss_type'):
             self.loss_type = args.loss_type
         else:
@@ -110,12 +109,10 @@ class KTOTrainer(RLHFTrainerMixin, SwiftMixin, HFKTOTrainer):
             logits, labels, label_pad_token_id=self.label_pad_token_id, reduction='sum')
         if self.template.padding_free:
             cu_seqlens = self.get_cu_seqlens(text_position_ids, inputs.get('logits_to_keep'))
-            all_logps = per_token_logps.new_zeros(cu_seqlens.shape[0] - 1)
-            all_logits = per_token_logps.new_zeros(cu_seqlens.shape[0] - 1)
-            for i in range(cu_seqlens.shape[0] - 1):
-                start, end = cu_seqlens[i], cu_seqlens[i + 1]
-                all_logps[i] = per_token_logps[:, start:end].sum()
-                all_logits[i] = sum_logits[:, start:end].sum()
+            completion_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            packed_values = torch.stack((per_token_logps.flatten(), sum_logits.to(per_token_logps.dtype).flatten()),
+                                        dim=-1)
+            all_logps, all_logits = self._packed_sequence_sum(packed_values, completion_lengths).unbind(dim=-1)
         else:
             all_logps = per_token_logps.sum(-1)
             all_logits = sum_logits.sum(-1)

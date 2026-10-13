@@ -106,7 +106,7 @@ class ModelMeta:
     def check_requires(self, model_info=None):
         extra_requires = []
         if model_info and model_info.quant_method:
-            mapping = {'bnb': ['bitsandbytes'], 'awq': ['autoawq'], 'gptq': ['auto_gptq'], 'aqlm': ['aqlm']}
+            mapping = {'bnb': ['bitsandbytes'], 'awq': ['autoawq'], 'gptq': ['gptqmodel'], 'aqlm': ['aqlm']}
             extra_requires += mapping.get(model_info.quant_method, [])
         requires = []
         for require in self.requires + extra_requires:
@@ -145,15 +145,18 @@ class ModelInfo:
 
 def get_model_name(model_id_or_path: str) -> Optional[str]:
     assert isinstance(model_id_or_path, str), f'model_id_or_path: {model_id_or_path}'
+    if platform.system().lower() == 'windows':
+        model_id_or_path = model_id_or_path.replace('\\', '/')
     # compat hf hub
     model_id_or_path = model_id_or_path.rstrip('/')
-    match_ = re.search('/models--.+?--(.+?)/snapshots/', model_id_or_path)
+    match_ = re.search('/models--(?:.+?--)?(.+?)/snapshots/', model_id_or_path)
+    if match_ is None:
+        # compat modelscope-hub
+        match_ = re.search('/models/(?:.+?--)?(.+?)/snapshots/', model_id_or_path)
     if match_ is not None:
         return match_.group(1)
 
     model_name = model_id_or_path.rsplit('/', 1)[-1]
-    if platform.system().lower() == 'windows':
-        model_name = model_name.rsplit('\\', 1)[-1]
     # compat modelscope snapshot_download
     model_name = model_name.replace('___', '.')
     return model_name
@@ -202,6 +205,10 @@ def _read_args_json_model_type(model_dir):
 
 
 def _get_model_info(model_dir: str, model_type: Optional[str], quantization_config) -> ModelInfo:
+    logger.warning(f'Loading model from {model_dir!r} with trust_remote_code=True. '
+                   'This will execute custom Python code shipped in the model repository '
+                   '(e.g. configuration_*.py, modeling_*.py, tokenization_*.py). '
+                   'Only proceed if you trust the source of this model.')
     try:
         config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     except Exception:

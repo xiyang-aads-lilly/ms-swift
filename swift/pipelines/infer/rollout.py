@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import multiprocessing
 import os
+import secrets
 import time
 import torch
 import torch.distributed.distributed_c10d as c10d
@@ -28,11 +29,11 @@ from aiohttp import ClientConnectorError
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
-from transformers.utils import is_torch_npu_available
+from transformers.utils import is_torch_musa_available, is_torch_npu_available
 from typing import Any, Dict, List, Optional, Union
 
 from swift.arguments import RolloutArguments
@@ -42,12 +43,12 @@ from swift.infer_engine.protocol import (InitCommunicatorRequest, RequestConfig,
 from swift.rlhf_trainers.utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedTensorBucket,
                                        FlattenedTensorMetadata, TensorLoRARequest, UpdateAdapterRequest,
                                        UpdateFlattenedAdapterRequest, UpdateFlattenedParamsRequest,
-                                       check_vllm_version_ge, chunk_list, finish_vllm_weight_reload,
-                                       patch_vllm_load_adapter, patch_vllm_moe_model_weight_loader,
-                                       vllm_supports_lora_load_inplace)
+                                       broadcast_tensor_for_vllm_weight_sync, check_vllm_version_ge, chunk_list,
+                                       finish_vllm_weight_reload, patch_vllm_load_adapter,
+                                       patch_vllm_moe_model_weight_loader, vllm_supports_lora_load_inplace)
 from swift.rollout import RolloutScheduler, multi_turns
-from swift.utils import (gc_collect, get_logger, get_seed, get_torch_device, ipc_collect, is_vllm_ascend_available,
-                         is_vllm_metax_available, synchronize)
+from swift.utils import (gc_collect, get_logger, get_physical_device_count, get_seed, ipc_collect, is_torch_rocm,
+                         is_vllm_ascend_available, is_vllm_kunlun_available, is_vllm_metax_available, synchronize)
 from ..base import SwiftPipeline
 
 try:
@@ -60,6 +61,9 @@ try:
     from vllm.distributed.utils import StatelessProcessGroup
     if is_vllm_ascend_available():
         from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator  # noqa
+
+    if is_vllm_kunlun_available():
+        from vllm_kunlun.distributed.py_kunlun_communicator import PyKunlunCommunicator as PyNcclCommunicator  # noqa
 
     if is_vllm_metax_available():
         import vllm_metax.patch
@@ -89,8 +93,7 @@ def _set_death_signal():
     """Ensure this process is killed when its parent exits.
 
     Prevents orphan vLLM TP worker processes from leaking GPU memory
-    when the parent Ray actor dies unexpectedly.  Adopted from verl's
-    ``set_death_signal`` utility.
+    when the parent Ray actor dies unexpectedly.
     """
     import ctypes
     import platform
@@ -101,6 +104,10 @@ def _set_death_signal():
     libc.prctl(1, signal.SIGKILL)
     if os.getppid() == 1:
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _patch_full_weight_reload_loader(model) -> None:
+    patch_vllm_moe_model_weight_loader(model, load_preprocessed_weight=is_vllm_ascend_available())
 
 
 class WeightSyncWorkerExtension:
@@ -182,13 +189,14 @@ class WeightSyncWorkerExtension:
         weight = torch.empty(shape, dtype=dtype, device=self.communicator.device)
 
         # Use NCCL to broadcast the updated weights from the client (src) to all workers.
-        self.communicator.broadcast(
-            weight, src=self.client_rank, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+        broadcast_tensor_for_vllm_weight_sync(self.communicator, weight, src=self.client_rank)
         synchronize()
         self.communicator.group.barrier()
 
-        # Patch MoE weight_loader if needed
-        patch_vllm_moe_model_weight_loader(self.model_runner.model)
+        # Patch MoE weight_loader if needed. This endpoint updates base weights
+        # one by one, so use the same full-reload layout setup as flattened
+        # base-weight sync before the final post-load processing request.
+        _patch_full_weight_reload_loader(self.model_runner.model)
 
         # Load the received weights into the model.
         self.model_runner.model.load_weights(weights=[(name, weight)])
@@ -203,8 +211,7 @@ class WeightSyncWorkerExtension:
 
         total_bytes = metadatas[-1].end_idx
         flatten_tensor = torch.empty(total_bytes, dtype=torch.uint8, device=self.communicator.device)
-        self.communicator.broadcast(
-            flatten_tensor, src=self.client_rank, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+        broadcast_tensor_for_vllm_weight_sync(self.communicator, flatten_tensor, src=self.client_rank)
         synchronize()
         self.communicator.group.barrier()
 
@@ -242,8 +249,7 @@ class WeightSyncWorkerExtension:
             dtype = getattr(torch, metadata['dtype'].split('.')[-1])
             shape = tuple(metadata['shape'])
             tensor = torch.empty(shape, dtype=dtype, device=self.communicator.device)
-            self.communicator.broadcast(
-                tensor, src=self.client_rank, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+            broadcast_tensor_for_vllm_weight_sync(self.communicator, tensor, src=self.client_rank)
             named_params[name] = tensor
 
         synchronize()
@@ -277,21 +283,26 @@ class WeightSyncWorkerExtension:
         total_bytes = metadatas[-1].end_idx
         flatten_tensor = torch.empty(total_bytes, dtype=torch.uint8, device=self.communicator.device)
 
-        self.communicator.broadcast(
-            flatten_tensor, src=self.client_rank, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+        broadcast_tensor_for_vllm_weight_sync(self.communicator, flatten_tensor, src=self.client_rank)
         synchronize()
         self.communicator.group.barrier()
 
         named_params = FlattenedTensorBucket(metadata=metadatas, flattened_tensor=flatten_tensor).reconstruct_tensors()
 
-        patch_vllm_moe_model_weight_loader(self.model_runner.model)
-        # Re-run process_weights_after_loading on FusedMoE layers so the
-        # kernel-format layout is rebuilt after the in-place reload
-        # (workaround for vLLM issue #42821).
-        try:
-            self.model_runner.model.load_weights(weights=list(named_params.items()))
-        finally:
-            finish_vllm_weight_reload(self.model_runner.model)
+        _patch_full_weight_reload_loader(self.model_runner.model)
+        self.model_runner.model.load_weights(weights=list(named_params.items()))
+
+    def process_weights_after_loading(self) -> None:
+        """Re-run process_weights_after_loading once after ALL weight
+        buckets have been loaded, so the kernel-format layout is rebuilt
+        on complete weights rather than partial ones.
+
+        Uses vLLM's built-in ``process_weights_after_loading`` when
+        *model_config* and *target_device* are available (same as verl);
+        falls back to FusedMoE-only path otherwise.
+        """
+        model_config = self.model_runner.model_config
+        finish_vllm_weight_reload(self.model_runner.model, model_config=model_config, target_device=self.device)
 
     def close_communicator(self) -> None:
         """
@@ -314,9 +325,6 @@ class WeightSyncWorkerExtension:
     # NCCL broadcast hop of ``update_flattened_params`` and reuses the
     # sender's bucket buffer via CUDA IPC (same node, same device) or
     # shared memory (CPU / cross-device fallback).
-    #
-    # Reference: twinkle ``TwinkleWorkerExtension.update_weights_from_ipc``
-    # and verl ``vLLMColocateWorkerExtension.update_weights_from_ipc``.
     #
     # TP>1:
     #   Only the TP driver (rank 0 in the TP group) talks to the ZMQ
@@ -377,7 +385,7 @@ class WeightSyncWorkerExtension:
         ``rebuild_cuda_tensor`` and reuse the cached mapping.  This avoids
         accumulating IPC mappings that the CUDA driver releases lazily,
         which is the root cause of apparent GPU memory growth under
-        frequent syncs.  (Aligned with twinkle / verl.)
+        frequent syncs.
 
         When ``peft_config`` is provided and ``base_sync_done`` is True,
         the received weights are loaded as a LoRA adapter via
@@ -472,7 +480,8 @@ class WeightSyncWorkerExtension:
         is_lora_sync = (peft_config is not None and base_sync_done)
         all_lora_weights: Dict[str, Any] = {} if is_lora_sync else None
 
-        patch_vllm_moe_model_weight_loader(self.model_runner.model)
+        if not is_lora_sync:
+            _patch_full_weight_reload_loader(self.model_runner.model)
 
         while True:
             metadata = socket.recv_pyobj() if is_driver else None
@@ -493,7 +502,7 @@ class WeightSyncWorkerExtension:
                 raw = buffer[offset:offset + size]
                 tensor = raw.view(dtype=dtype).view(shape)
                 if use_shm:
-                    tensor = tensor.to(device)
+                    tensor = tensor.to(device, copy=True)
                 else:
                     tensor = tensor.clone()
                 weights.append((name, tensor))
@@ -501,11 +510,13 @@ class WeightSyncWorkerExtension:
             if _torch.cuda.is_available():
                 _torch.cuda.synchronize()
 
-            if is_driver:
-                socket.send(b'')  # bucket received
-
+            # The sender can overwrite the shared buffer as soon as it receives
+            # the ACK, so every TP rank must finish its local copies first.
             if tp_size > 1:
                 _dist.barrier(group=cpu_group)
+
+            if is_driver:
+                socket.send(b'')  # all TP ranks have copied this bucket
 
             if is_lora_sync:
                 for name, tensor in weights:
@@ -516,12 +527,13 @@ class WeightSyncWorkerExtension:
             if metadata.get('is_last'):
                 break
 
-        # Re-run process_weights_after_loading on FusedMoE layers so the
-        # kernel-format layout is rebuilt after the in-place reload
-        # (workaround for vLLM issue #42821).  Skipped for LoRA sync
-        # because the adapter path doesn't call ``load_weights``.
+        # Re-run process_weights_after_loading so the kernel-format
+        # layout is rebuilt after the in-place reload (vLLM issue
+        # #42821).  Skipped for LoRA sync because the adapter path
+        # doesn't call ``load_weights``.
         if not is_lora_sync:
-            finish_vllm_weight_reload(self.model_runner.model)
+            model_config = self.model_runner.model_config
+            finish_vllm_weight_reload(self.model_runner.model, model_config=model_config, target_device=self.device)
 
         if is_lora_sync and all_lora_weights:
             req_kw = dict(
@@ -576,7 +588,6 @@ def get_rollout_engine_type(args: RolloutArguments, engine: GRPOVllmEngine):
             kwargs.update({
                 'use_gym_env': args.use_gym_env,
                 'gym_env': args.gym_env,
-                'context_manager': args.context_manager,
             })
 
         rollout_engine: RolloutScheduler = scheduler_cls(infer_engine=engine, max_turns=args.max_turns, **kwargs)
@@ -592,6 +603,9 @@ def _set_visible_devices_for_dp_rank(data_parallel_rank: int, tensor_parallel_si
     def _get_device_env_var():
         if is_torch_npu_available():
             return 'ASCEND_RT_VISIBLE_DEVICES'
+        if is_torch_musa_available():
+            # CUDA_VISIBLE_DEVICES is moved to MUSA_VISIBLE_DEVICES on `import swift`.
+            return 'MUSA_VISIBLE_DEVICES'
         return 'CUDA_VISIBLE_DEVICES'
 
     env_var = _get_device_env_var()
@@ -605,6 +619,32 @@ def _set_visible_devices_for_dp_rank(data_parallel_rank: int, tensor_parallel_si
     start = data_parallel_rank * tensor_parallel_size
     end = start + tensor_parallel_size
     selected = all_devices[start:end]
+
+    # ROCm: do NOT shrink the visibility mask to ``selected``. Restricting
+    # CUDA_VISIBLE_DEVICES (e.g. to "6,7") makes vLLM renumber those GPUs locally
+    # as cuda:0,1, so the device ids the rollout uses/reports diverge from the
+    # trainer's global numbering, and the cross-process RCCL weight-sync fails on
+    # ROCm with "invalid device ordinal" (the trainer can't resolve the rollout's
+    # GPUs). Instead keep EVERY physical GPU visible and only reorder the mask so
+    # the selected devices come first: vLLM still lands on the intended physical
+    # GPUs (cuda:0..tp-1 -> selected), while RCCL can resolve all peers (incl. the
+    # trainer's GPUs) by PCI bus id, so train<->rollout communication works.
+    if env_var == 'CUDA_VISIBLE_DEVICES' and is_torch_rocm():
+        total = get_physical_device_count()
+        sel_ints = []
+        for x in selected:
+            try:
+                sel_ints.append(int(x))
+            except ValueError:
+                sel_ints = []
+                break
+        if sel_ints and all(0 <= i < total for i in sel_ints):
+            rest = [i for i in range(total) if i not in sel_ints]
+            reordered = ','.join(str(i) for i in (sel_ints + rest))
+            os.environ['CUDA_VISIBLE_DEVICES'] = reordered
+            os.environ['HIP_VISIBLE_DEVICES'] = reordered
+            return
+
     os.environ[env_var] = ','.join(selected)
 
 
@@ -694,21 +734,49 @@ class SwiftRolloutDeploy(SwiftPipeline):
     args_class = RolloutArguments
     args: args_class
 
+    def _require_api_key(self):
+        """enforces the inherited ``api_key`` on every route."""
+
+        async def _dep(request: Request) -> None:
+            api_key = self.args.api_key
+            if not api_key:
+                return  # explicitly unauthenticated
+            authorization = request.headers.get('Authorization', '')
+            if not authorization or not authorization.startswith('Bearer '):
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, 'Missing bearer token')
+            if not secrets.compare_digest(authorization[7:], api_key):
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, 'Invalid API key')
+
+        return _dep
+
+    def _warn_if_unauthenticated(self):
+        """Warn when the rollout server is reachable from other hosts with authentication disabled."""
+        args = self.args
+        if args.api_key or args.host in {'127.0.0.1', 'localhost', '::1'}:
+            return
+        logger.warning(f'The rollout server is listening on {args.host}:{args.port} without an API key, so '
+                       'anyone able to reach this port can overwrite model weights, run inference, or '
+                       'disrupt the service. Pass `--api_key` to require one, and `--host 127.0.0.1` '
+                       'to accept local connections only.')
+
     def _register_rl_rollout_app(self):
+        guard = [Depends(self._require_api_key())]
+        self.app.get('/health')(self.health)
         self.app.get('/health/')(self.health)
-        self.app.get('/get_world_size/')(self.get_world_size)
-        self.app.get('/get_model_state_keys/')(self.get_model_state_keys)
-        self.app.post('/init_communicator/')(self.init_communicator)
-        self.app.post('/update_named_param/')(self.update_named_param)
-        self.app.post('/update_adapter_flattened_param/')(self.update_adapter_flattened_param)
-        self.app.post('/update_adapter_param/')(self.update_adapter_param)
-        self.app.post('/update_flattened_params/')(self.update_flattened_params)
-        self.app.post('/reset_prefix_cache/')(self.reset_prefix_cache)
-        self.app.post('/reset_encoder_cache/')(self.reset_encoder_cache)
-        self.app.post('/reset_mm_cache/')(self.reset_mm_cache)
-        self.app.post('/close_communicator/')(self.close_communicator)
-        self.app.post('/infer/', response_model=None)(self.infer)
-        self.app.post('/get_engine_type/')(self.get_engine_type)
+        self.app.get('/get_world_size/', dependencies=guard)(self.get_world_size)
+        self.app.get('/get_model_state_keys/', dependencies=guard)(self.get_model_state_keys)
+        self.app.post('/init_communicator/', dependencies=guard)(self.init_communicator)
+        self.app.post('/update_named_param/', dependencies=guard)(self.update_named_param)
+        self.app.post('/update_adapter_flattened_param/', dependencies=guard)(self.update_adapter_flattened_param)
+        self.app.post('/update_adapter_param/', dependencies=guard)(self.update_adapter_param)
+        self.app.post('/update_flattened_params/', dependencies=guard)(self.update_flattened_params)
+        self.app.post('/process_weights_after_loading/', dependencies=guard)(self.process_weights_after_loading)
+        self.app.post('/reset_prefix_cache/', dependencies=guard)(self.reset_prefix_cache)
+        self.app.post('/reset_encoder_cache/', dependencies=guard)(self.reset_encoder_cache)
+        self.app.post('/reset_mm_cache/', dependencies=guard)(self.reset_mm_cache)
+        self.app.post('/close_communicator/', dependencies=guard)(self.close_communicator)
+        self.app.post('/infer/', response_model=None, dependencies=guard)(self.infer)
+        self.app.post('/get_engine_type/', dependencies=guard)(self.get_engine_type)
 
     def __init__(self, args: Optional[Union[List[str], RolloutArguments]] = None):
         super().__init__(args)
@@ -931,6 +999,18 @@ class SwiftRolloutDeploy(SwiftPipeline):
 
         return {'message': 'Request received, updating flattened parameters'}
 
+    async def process_weights_after_loading(self):
+        """
+        Triggers process_weights_after_loading on all workers.
+        """
+        kwargs = {'method': 'process_weights_after_loading', 'args': ()}
+        for connection in self.connections:
+            connection.send({'type': 'call', 'method': 'collective_rpc', 'kwargs': kwargs})
+        # Wait for all workers to complete before returning
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*(loop.run_in_executor(None, connection.recv) for connection in self.connections))
+        return {'message': 'Weights processed after loading'}
+
     async def reset_prefix_cache(self):
         """
         Resets the prefix cache for the model.
@@ -1028,6 +1108,7 @@ class SwiftRolloutDeploy(SwiftPipeline):
 
     def run(self):
         args = self.args
+        self._warn_if_unauthenticated()
         uvicorn.run(self.app, host=args.host, port=args.port, log_level=args.log_level)
 
 

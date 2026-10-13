@@ -7,6 +7,7 @@ from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayer
 from megatron.core.inference.communication_utils import recv_from_prev_pipeline_rank_, send_to_next_pipeline_rank
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.transformer.moe.router import TopKRouter
 from torch import nn
 from transformers.utils import is_torch_npu_available
@@ -93,7 +94,7 @@ def get_target_modules(args, model):
         return args.target_modules
     target_modules = args.target_modules.copy()
     if 'all-linear' in target_modules:
-        if args.is_multimodal:
+        if args.is_multimodal and not args.language_model_only:
             if args.tuner_type == 'lora_llm':
                 kwargs = {
                     'freeze_llm': False,
@@ -170,11 +171,31 @@ def _prepare_full_vit(args, model):
             module.requires_grad_(True)
 
 
+def _freeze_engram_parameters(model) -> None:
+    """Freeze DeepSeek-V4.1 Engram parameters for on-policy RL.
+
+    Engram tables reach hundreds of GiB on the real checkpoint, so they cannot be resynced to the
+    rollout engine every step. Freezing the whole Engram subsystem keeps training on-policy: the
+    rest of the model is updated and vLLM keeps the base Engram (the RL weight-sync path skips
+    exporting them; see MegatronRolloutMixin._export_and_load_weights).
+    """
+    frozen = []
+    for name, param in model.named_parameters():
+        if ('.engram.' in name or getattr(param, 'is_engram_embedding', False)) and param.requires_grad:
+            param.requires_grad = False
+            frozen.append(name)
+    if frozen:
+        logger.info(f'Froze {len(frozen)} DeepSeek-V4.1 Engram parameters for on-policy RL, '
+                    f'e.g. {frozen[:2]}.')
+
+
 def prepare_mcore_model(args, model):
     if args.tuner_type == 'full':
         freeze_parameters(model, args.freeze_parameters_ratio, args.freeze_parameters, args.freeze_parameters_regex)
         if args.trainable_parameters or args.trainable_parameters_regex:
             activate_parameters(model, args.trainable_parameters, args.trainable_parameters_regex)
+        if args.rlhf_type == 'grpo' and args.model_type == 'deepseek_v41':
+            _freeze_engram_parameters(model)
     elif args.tuner_type in {'lora', 'lora_llm'}:
         model = prepare_adapter(args, model)
         if args.tuner_type == 'lora_llm':
@@ -216,6 +237,11 @@ def get_padding_to(args):
     fp4_format = getattr(args, 'fp4_format', None) or getattr(args, 'fp4', None)
     if args.fp8_recipe == 'blockwise':
         padding_to = (padding_to or 1) * 128
+    elif args.fp8_recipe == 'mxfp8':
+        # MXFP8 uses a block size of 32. Under sequence parallel, the sequence is
+        # split across TP ranks, so each per-rank shard (seq_len / TP) must itself
+        # be divisible by 32. Pad the total length to TP * 32 to guarantee this.
+        padding_to = (padding_to or 1) * 32
     elif fp8_format is not None or fp4_format is not None:
         padding_to = (padding_to or 1) * 16
     if args.attention_backend == 'fused':
@@ -223,17 +249,74 @@ def get_padding_to(args):
     return padding_to
 
 
-def get_packed_seq_params(position_ids: torch.Tensor) -> PackedSeqParams:
+def get_packed_seq_params(args, position_ids: torch.Tensor) -> PackedSeqParams:
     params = _get_packed_seq_params(position_ids)
+    # max_seqlen must be a Python int rather than a 0-dim CUDA tensor.
+    # flash-attn 4 (CuTe DSL) embeds booleans derived from max_seqlen into its
+    # backward-kernel compile-cache key; a tensor there hashes by object identity,
+    # so the cache never hits and every micro-batch backward triggers a full JIT
+    # recompilation (~30s each), slowing training by >10x.
+    max_seqlen_q = params['max_length_q']
+    max_seqlen_kv = params['max_length_k']
+    if isinstance(max_seqlen_q, torch.Tensor):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if isinstance(max_seqlen_kv, torch.Tensor):
+        max_seqlen_kv = int(max_seqlen_kv.item())
     packed = PackedSeqParams(
         cu_seqlens_q=params['cu_seq_lens_q'],
         cu_seqlens_kv=params['cu_seq_lens_k'],
-        max_seqlen_q=params['max_length_q'],
-        max_seqlen_kv=params['max_length_k'],
-        qkv_format='thd')
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        qkv_format='thd',
+    )
+    if hasattr(packed, 'total_tokens'):
+        packed.total_tokens = position_ids.numel()
+    if hasattr(packed, 'cp_partition_mode'):
+        packed.cp_partition_mode = args.cp_partition_mode
 
     if is_torch_npu_available():
         packed.cu_seqlens_q_padded = params['cu_seq_lens_q']
         packed.cu_seqlens_kv_padded = params['cu_seq_lens_k']
 
     return packed
+
+
+def reconstruct_tensor_cp(tensor, packed_seq_params, dim=1, cp_partition_mode='zigzag') -> torch.Tensor:
+    """In CP mode, all-gather and undo the configured partitioning
+    produced by ``split_cp_inputs``, restoring the full sequence in original
+    token order along ``dim``.
+
+    Args:
+        tensor: CP-sharded local tensor whose sequence dim is at ``dim``.
+        packed_seq_params: ``PackedSeqParams`` for THD inputs, or ``None`` for
+            regular ``[B, S, ...]`` inputs.
+        dim: Sequence dimension index of ``tensor`` (default: 1).
+        cp_partition_mode: CP partition layout, either ``zigzag`` or ``contiguous``.
+
+    Returns:
+        torch.Tensor: Full-sequence tensor with the same shape as ``tensor``
+        except the size at ``dim`` is multiplied by ``cp_size``.
+    """
+
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return tensor
+
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_group = mpu.get_context_parallel_group()
+
+    # All-gather across CP ranks (preserve local autograd graph for `tensor`).
+    output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+    torch.distributed.all_gather(output_list, tensor.contiguous(), group=cp_group)
+    output_list[cp_rank] = tensor
+    gathered = torch.cat(output_list, dim=dim)
+    if cp_partition_mode == 'contiguous':
+        return gathered
+
+    # `_undo_attention_load_balancing` assumes sequence dim is 0; transpose if needed.
+    if dim != 0:
+        gathered = gathered.transpose(0, dim).contiguous()
+    out = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
+    if dim != 0:
+        out = out.transpose(0, dim).contiguous()
+    return out

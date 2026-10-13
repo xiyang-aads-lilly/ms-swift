@@ -44,7 +44,7 @@ def register_model(model_meta: ModelMeta, *, exist_ok: bool = False) -> None:
 
 def load_by_unsloth(args):
     """Load model by unsloth"""
-    assert is_unsloth_available(), 'please install unsloth if using `use_unsloth=True`: `pip install unsloth`'
+    assert is_unsloth_available(), 'please install unsloth if using `--tuner_backend unsloth`: `pip install unsloth`'
     os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
     os.environ['UNSLOTH_DISABLE_STATISTICS'] = '1'
     model_info = args.model_info
@@ -158,6 +158,7 @@ def get_model_list() -> List[str]:
 
 
 class ModelLoader(BaseModelLoader):
+    default_trust_remote_code = True
 
     def __init__(
         self,
@@ -244,8 +245,12 @@ class ModelLoader(BaseModelLoader):
         return config
 
     def get_config(self, model_dir: str) -> PretrainedConfig:
+        if self.default_trust_remote_code:
+            logger.warning(f'Loading config from {model_dir!r} with trust_remote_code=True. '
+                           'Custom Python code from the model repository will be executed. '
+                           'Only use models from sources you trust.')
         auto_config_cls = self.auto_config_cls or AutoConfig
-        return auto_config_cls.from_pretrained(model_dir, trust_remote_code=True)
+        return auto_config_cls.from_pretrained(model_dir, trust_remote_code=self.default_trust_remote_code)
 
     def _get_tokenizer(self, processor):
         if not isinstance(processor, PreTrainedTokenizerBase) and hasattr(processor, 'tokenizer'):
@@ -256,6 +261,10 @@ class ModelLoader(BaseModelLoader):
         return tokenizer
 
     def get_processor(self, model_dir: str, config: PretrainedConfig) -> Processor:
+        if self.default_trust_remote_code:
+            logger.warning(f'Loading tokenizer/processor from {model_dir!r} with trust_remote_code=True. '
+                           'Custom Python code from the model repository will be executed. '
+                           'Only use models from sources you trust.')
         auto_tokenizer_cls = self.auto_tokenizer_cls
         if auto_tokenizer_cls is None:
             if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')) or os.path.exists(
@@ -264,7 +273,7 @@ class ModelLoader(BaseModelLoader):
                 auto_tokenizer_cls = AutoProcessor
             else:
                 auto_tokenizer_cls = AutoTokenizer
-        return auto_tokenizer_cls.from_pretrained(model_dir, trust_remote_code=True)
+        return auto_tokenizer_cls.from_pretrained(model_dir, trust_remote_code=self.default_trust_remote_code)
 
     def get_model(self, model_dir: str, config: PretrainedConfig, processor: Processor,
                   model_kwargs) -> PreTrainedModel:
@@ -283,7 +292,7 @@ class ModelLoader(BaseModelLoader):
             with patch_automodel_for_sequence_classification(model_config=config, patch_from_pretrained=False):
                 try:
                     model = AutoModelForSequenceClassification.from_pretrained(
-                        model_dir, config=config, trust_remote_code=True, **self.model_kwargs)
+                        model_dir, config=config, trust_remote_code=self.default_trust_remote_code, **self.model_kwargs)
                     auto_model_cls = AutoModelForSequenceClassification
                 except ValueError:
                     pass
@@ -312,7 +321,8 @@ class ModelLoader(BaseModelLoader):
             else:
                 context = partial(patch_automodel, **context_kwargs)
             with context():
-                model = auto_model_cls.from_pretrained(model_dir, config=config, trust_remote_code=True, **model_kwargs)
+                model = auto_model_cls.from_pretrained(
+                    model_dir, config=config, trust_remote_code=self.default_trust_remote_code, **model_kwargs)
         # fix not save modeling_xxx.py (transformers 4.45)
         # https://github.com/huggingface/transformers/issues/24737
         has_remote_code = hasattr(config, 'auto_map') and auto_model_cls.__name__ in config.auto_map
@@ -442,6 +452,23 @@ class ModelLoader(BaseModelLoader):
             elif hf_model_type == 'glm_moe_dsa':
                 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaMoE
                 z3_leaf_modules = [GlmMoeDsaMoE]
+            elif hf_model_type == 'mimo_v2':
+                # trust_remote_code model: MiMoV2MoE is not in transformers.models.*
+                for module in model.modules():
+                    if type(module).__name__ == 'MiMoV2MoE':
+                        z3_leaf_modules = [type(module)]
+                        break
+            elif hf_model_type == 'bailing_hybrid':
+                for module in model.modules():
+                    if type(module).__name__ == 'BailingMoeV3SparseMoeBlock':
+                        z3_leaf_modules = [type(module)]
+                        break
+            elif hf_model_type == 'xing4_0':
+                # trust_remote_code model: Xing4_0MoE is not in transformers.models.*
+                for module in model.modules():
+                    if type(module).__name__ == 'Xing4_0MoE':
+                        z3_leaf_modules = [type(module)]
+                        break
 
         if z3_leaf_modules:
             from deepspeed.utils import set_z3_leaf_modules
@@ -455,7 +482,7 @@ class ModelLoader(BaseModelLoader):
             model.generation_config = GenerationConfig.from_pretrained(model_dir) if os.path.isfile(
                 generation_config_path) else None
         # fix llama2 warning
-        if getattr(model, 'generation_config', None):
+        if getattr(model, 'generation_config', None) and hasattr(model.generation_config, 'do_sample'):
             fix_do_sample_warning(model.generation_config)
 
     def _get_model_processor(self, model_dir, config):
@@ -470,6 +497,7 @@ class ModelLoader(BaseModelLoader):
         model_dir = self.model_info.model_dir
         with patch_get_dynamic_module(), patch_tp_plan(self.load_model), patch_offload_context:
             config = self.get_config(model_dir)
+            config.name_or_path = model_dir
             self._postprocess_config(config)
             model, processor = self._get_model_processor(model_dir, config)
             self._postprocess_processor(processor)
@@ -484,7 +512,9 @@ class SentenceTransformersLoader(ModelLoader):
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer(
-            model_dir, trust_remote_code=True, model_kwargs={
+            model_dir,
+            trust_remote_code=self.default_trust_remote_code,
+            model_kwargs={
                 'torch_dtype': self.torch_dtype,
             })
         model.config = config
@@ -529,7 +559,7 @@ def get_model_processor(
     max_model_len: Optional[int] = None,
     auto_model_cls=None,
     new_special_tokens: Optional[List[str]] = None,
-    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker'] = None,
+    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker', 'decision'] = None,
     num_labels: Optional[int] = None,
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None,
     return_dummy_model: bool = False,
@@ -635,7 +665,7 @@ def get_processor(
     download_model: Optional[bool] = None,
     # model kwargs
     model_type: Optional[str] = None,
-    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker'] = None,
+    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker', 'decision'] = None,
     num_labels: Optional[int] = None,
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None,
     **kwargs,

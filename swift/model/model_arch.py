@@ -25,6 +25,7 @@ class LLMModelArch:
 
 
 class MLLMModelArch:
+    moss_vl = 'moss_vl'
     qwen_vl = 'qwen_vl'
     qwen_audio = 'qwen_audio'
     qwen2_vl = 'qwen2_vl'
@@ -33,6 +34,9 @@ class MLLMModelArch:
     qwen3_vl = 'qwen3_vl'
     qwen3_omni = 'qwen3_omni'
     qwen3_asr = 'qwen3_asr'
+    qwen3_tts = 'qwen3_tts'
+    qwen3_5 = 'qwen3_5'
+    wemm_embedding = 'wemm_embedding'
 
     cogvlm = 'cogvlm'
     chatglm4v = 'chatglm4v'
@@ -62,6 +66,8 @@ class MLLMModelArch:
     deepseek_janus = 'deepseek_janus'
     deepseek_ocr = 'deepseek_ocr'
     deepseek_ocr2 = 'deepseek_ocr2'
+    deepseek_v41 = 'deepseek_v41'
+    unlimited_ocr = 'unlimited_ocr'
     kimi_k25 = 'kimi_k25'
 
     mplug_owl2 = 'mplug_owl2'
@@ -85,13 +91,19 @@ class MLLMModelArch:
     megrez_omni = 'megrez_omni'
     valley = 'valley'
     gemma3n = 'gemma3n'
+    gemma4_unified = 'gemma4_unified'
+    diffusion_gemma = 'diffusion_gemma'
     keye_vl = 'keye_vl'
 
     midashenglm = 'midashenglm'
     step_audio2_mini = 'step_audio2_mini'
     hunyuan_vl = 'hunyuan_vl'
     step3_vl = 'step3_vl'
-    paddle_ocr_1_5 = 'paddle_ocr_1_5'
+    mimo_v2 = 'mimo_v2'
+    paddleocr_vl = 'paddleocr_vl'
+    minimax_m3_vl = 'minimax_m3_vl'
+    muse_glimmer = 'muse_glimmer'
+    monkeyocrv2 = 'monkeyocrv2'
 
 
 class ModelArch(LLMModelArch, MLLMModelArch):
@@ -473,10 +485,26 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
+        MLLMModelArch.unlimited_ocr,
+        language_model=['model.embed_tokens', 'model.layers', 'model.norm', 'lm_head'],
+        vision_tower=['model.vision_model', 'model.sam_model'],
+        aligner=['model.projector'],
+    ))
+
+register_model_arch(
+    MultiModelKeys(
         MLLMModelArch.deepseek_vl2,
         language_model='language',
         vision_tower='vision',
         aligner='projector',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.deepseek_v41,
+        language_model='model',
+        vision_tower='vision',
+        aligner='aligner',
     ))
 
 register_model_arch(
@@ -566,6 +594,7 @@ if transformers_ge_4_52:
             language_model=['model.language_model', 'lm_head'],
             aligner='model.visual.merger',
             vision_tower='model.visual',
+            mlp='model.language_model.layers.{}.mlp',
         ))
 else:
     register_model_arch(
@@ -574,7 +603,17 @@ else:
             language_model=['model', 'lm_head'],
             aligner='visual.merger',
             vision_tower='visual',
+            mlp='model.layers.{}.mlp',
         ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.moss_vl,
+        language_model=['model.language_model', 'lm_head'],
+        aligner=['model.visual.merger', 'model.separator_token'],
+        vision_tower='model.visual',
+        mlp='model.language_model.layers.{}.mlp',
+    ))
 
 register_model_arch(
     MultiModelKeys(
@@ -582,6 +621,17 @@ register_model_arch(
         language_model=['model.language_model', 'lm_head'],
         aligner=['model.visual.merger', 'model.visual.deepstack_merger_list'],
         vision_tower='model.visual',
+        mlp='model.language_model.layers.{}.mlp',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.muse_glimmer,
+        language_model=['model.language_model', 'lm_head'],
+        # Two-stage aligner: vision_adapter (fc1/fc2) then vision_projection to the text hidden size.
+        aligner=['model.vision_adapter', 'model.vision_projection'],
+        vision_tower='model.vision_tower',
+        mlp='model.language_model.layers.{}.mlp',
     ))
 
 register_model_arch(
@@ -611,6 +661,13 @@ register_model_arch(
         language_model=['thinker.model', 'thinker.lm_head'],
         vision_tower='thinker.audio_tower',
         aligner=['thinker.audio_tower.proj1', 'thinker.audio_tower.proj2'],
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.qwen3_tts,
+        language_model='talker',
+        generator='speaker_encoder',  # no grad
     ))
 
 register_model_arch(
@@ -753,6 +810,21 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
+        MLLMModelArch.gemma4_unified,
+        language_model=['model.language_model', 'lm_head'],
+        aligner=['model.embed_vision', 'model.embed_audio'],
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.diffusion_gemma,
+        language_model=['model.encoder.language_model', 'model.decoder', 'lm_head'],
+        vision_tower=['model.encoder.vision_tower'],
+        aligner=['model.encoder.embed_vision'],
+    ))
+
+register_model_arch(
+    MultiModelKeys(
         MLLMModelArch.keye_vl,
         language_model=['model', 'lm_head'],
         aligner='mlp_AR',
@@ -790,10 +862,53 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
-        MLLMModelArch.paddle_ocr_1_5,
+        MLLMModelArch.paddleocr_vl,
         language_model=['model.language_model', 'lm_head'],
         aligner='model.projector',
         vision_tower='model.visual',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.minimax_m3_vl,
+        language_model=['model.language_model', 'lm_head'],
+        aligner='model.multi_modal_projector',
+        vision_tower='model.vision_tower',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.mimo_v2,
+        language_model=['model', 'lm_head'],
+        aligner='visual.merger',
+        vision_tower=['visual', 'audio_encoder'],
+        mlp='model.layers.{}.mlp',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.qwen3_5,
+        language_model=['model.language_model', 'lm_head'],
+        aligner='model.visual.merger',
+        vision_tower='model.visual',
+        mlp='model.language_model.layers.{}.mlp',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.wemm_embedding,
+        language_model=['model.language_model', 'lm_head'],
+        aligner='model.visual.merger',
+        vision_tower='model.visual',
+        mlp='model.language_model.layers.{}.mlp',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.monkeyocrv2,
+        language_model=[],
+        aligner=[],
+        vision_tower=['', 'head'],
     ))
 
 

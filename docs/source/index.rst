@@ -20,7 +20,7 @@ Swift DOCUMENTATION
    Instruction/Command-line-parameters.md
    Instruction/Pre-training-and-Fine-tuning.md
    Instruction/GRPO/index.rst
-   Instruction/GKD.md
+   Instruction/Distillation.md
    Instruction/RLHF.md
    Instruction/Inference-and-deployment.md
    Instruction/Sample.md
@@ -66,15 +66,18 @@ Swift DOCUMENTATION
    BestPractices/GRPO-Code-Training.md
    BestPractices/Qwen3-Best-Practice.md
    BestPractices/Qwen3-VL-Best-Practice.md
-   BestPractices/Qwen3_5-Best-Practice.md
+   BestPractices/Qwen3_8-Best-Practice.md
+   BestPractices/Qwen3_8-Flash-Next-Best-Practice.md
    BestPractices/deepseek-v4.md
    BestPractices/MLLM-Registration.md
    BestPractices/Embedding.md
    BestPractices/Reranker.md
+   BestPractices/Decision.md
    BestPractices/Rapidly-Training-VL-model.md
    BestPractices/NPU-support.md
    BestPractices/Metax-support.md
    BestPractices/AMD-support.md
+   BestPractices/MUSA-support.md
    BestPractices/More-Best-Practices.md
 
 Indices and tables

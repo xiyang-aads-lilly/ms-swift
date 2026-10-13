@@ -2,6 +2,7 @@ import os
 import torch
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1,2,3'
 os.environ['SWIFT_DEBUG'] = '1'
 
 
@@ -1019,6 +1020,39 @@ def test_deepseek_ocr_2():
                         'ModelScope创空间 中体验SWIFT web-ui功能了。')
 
 
+def test_ovis_ocr2():
+    engine = TransformersEngine('ATH-MaaS/OvisOCR2')
+    assert engine.model_info.model_type == 'ovis_ocr2'
+    assert engine.template.template_meta.template_type == 'ovis_ocr2'
+    assert engine.template.template_meta.is_thinking is False
+    ocr_prompt = (
+        '\nExtract all readable content from the image in natural human reading order and output the '
+        'result as a single Markdown document. For charts or images, represent them using an HTML image '
+        'tag: <'  # noqa: E501
+        'img src="images/bbox_{left}_{top}_{right}_{bottom}.jpg" />, where left, top, right, '
+        'bottom are bounding box coordinates scaled to [0, 1000). Format formulas as LaTeX. Format tables '
+        'as HTML: <table>...</table>. Transcribe all other text as standard Markdown. Preserve the '
+        'original text without translation or paraphrasing.')
+    images = ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png']
+    response = _infer_model(
+        engine, messages=[{
+            'role': 'user',
+            'content': f'<image>{ocr_prompt}'
+        }], images=images, max_tokens=4096)
+    assert response == ('<think>\n\n</think>\n\n'
+                        '<img src="images/bbox_47_38_89_90.jpg" />\n\n'
+                        '## 简介\n\n'
+                        'SWIFT支持250+ LLM和35+ MLLM（多模态大模型）的训练、推理、评测和部署。'
+                        '开发者可以直接将我们的框架应用到自己的Research和生产环境中，实现模型训练评测到应用的完整链路。'
+                        '我们除支持了PEFT提供的轻量训练方案外，也提供了一个完整的Adapters库以支持最新的训练技术，'
+                        '如NEFTune、LoRA+、LLaMA-PRO等，这个适配器库可以脱离训练脚本直接使用在自己的自定流程中。\n\n'
+                        '为方便不熟悉深度学习的用户使用，我们提供了一个Gradio的web-ui用于控制训练和推理，'
+                        '并提供了配套的深度学习课程和最佳实践供新手入门。\n\n'
+                        '此外，我们也在拓展其他模态的能力，目前我们支持了AnimateDiff的全参数训练和LoRA训练。\n\n'
+                        'SWIFT具有丰富的文档体系，如有使用问题请请查看这里.\n\n'
+                        '可以在Huggingface space 和 ModelScope创空间 中体验SWIFT web-ui功能了。')
+
+
 def test_llava_onevision1_5():
     engine = TransformersEngine('lmms-lab/LLaVA-OneVision-1.5-4B-Instruct')
     query = 'Describe this image.'
@@ -1032,6 +1066,7 @@ def test_llava_onevision1_5():
 
 def test_paddle_ocr():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0'
     engine = TransformersEngine('PaddlePaddle/PaddleOCR-VL')
     query = 'OCR:'
     messages = [{'role': 'user', 'content': query}]
@@ -1200,6 +1235,7 @@ def test_step3_vl():
 
 def test_paddle_ocr_1_5():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0'
     engine = TransformersEngine('PaddlePaddle/PaddleOCR-VL-1.5')
     query = 'OCR:'
     messages = [{'role': 'user', 'content': query}]
@@ -1258,6 +1294,29 @@ def test_mineru2_5_pro():
     }]
     response = _infer_model(engine, messages=messages, images=images)
     print(response)
+
+
+def test_unlimited_ocr():
+    engine = TransformersEngine('PaddlePaddle/Unlimited-OCR')
+    query = 'Free OCR.'
+    messages = [{'role': 'user', 'content': query}]
+    images = ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png']
+    response = _infer_model(engine, messages=messages, images=images, max_tokens=256)
+    print(response)
+
+
+def test_qwen3_8():
+    engine = TransformersEngine('Qwen/Qwen3.8-27B')
+    template = engine.template
+    assert engine.model_info.model_type == 'qwen3_5'
+    assert template.template_meta.template_type == 'qwen3_8'
+    # Qwen3.8 keeps historical thinking by default, unlike Qwen3.5/Qwen3.6.
+    assert template.template_meta.preserve_thinking is True
+    messages = [{'role': 'user', 'content': '<image>这是什么'}]
+    swift_response = _infer_model(engine, messages=messages)
+    engine.template.template_backend = 'jinja'
+    jinja_response = _infer_model(engine, messages=messages)
+    assert swift_response == jinja_response
 
 
 if __name__ == '__main__':
@@ -1326,7 +1385,7 @@ if __name__ == '__main__':
     # test_interns1()
     # test_internvl3_5()
     # test_minicpmv4_5()
-    test_minicpmv4_6()
+    # test_minicpmv4_6()
     # test_qwen3_vl()
     # test_keye_vl_1_5()
     # test_internvl3_hf()
@@ -1350,3 +1409,6 @@ if __name__ == '__main__':
     # test_glm_ocr()
     # test_gemma4()
     # test_mineru2_5_pro()
+    # test_unlimited_ocr()
+    # test_ovis_ocr2()
+    test_qwen3_8()

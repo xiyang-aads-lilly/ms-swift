@@ -12,6 +12,28 @@ If this is your first time using ms-swift on NPUs, we recommend reading this doc
 4. Use "Quick Start" to complete one ModelScope model LoRA training, merge, inference, and deployment flow.
 5. For larger-scale training, continue reading the DDP, DeepSpeed, and MindSpeed/Megatron-SWIFT sections.
 
+## Hardware and Supported Operating Systems
+
+**Table 1** Product hardware support list
+
+| Product | Supported |
+| ------- | :-------: |
+| <term>Ascend 950 series products</term> | √ |
+| <term>Atlas A3 training series products</term> | √ |
+| <term>Atlas A3 inference series products</term> | x |
+| <term>Atlas A2 training series products</term> | √ |
+| <term>Atlas A2 inference series products</term> | x |
+| <term>Atlas 200I/500 A2 inference products</term> | x |
+| <term>Atlas inference series products</term> | x |
+| <term>Atlas training series products</term> | x |
+
+> [!NOTE]
+>
+> In this section, "√" indicates supported and "x" indicates not supported.
+
+- For operating systems supported by each hardware product in physical-machine deployment scenarios, see the [Compatibility Query Assistant](https://www.hiascend.com/hardware/compatibility).
+- For operating systems supported by each hardware product in VM and container deployment scenarios, see "Operating System Compatibility" in CANN Software Installation for the [commercial edition](https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) or [community edition](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum).
+
 ## Support Scope at a Glance
 
 Recommended base environment versions:
@@ -19,9 +41,11 @@ Recommended base environment versions:
 | software  | version         |
 | --------- | --------------- |
 | Python    | >= 3.10, < 3.12 |
-| CANN      | == 8.5.1        |
-| torch     | == 2.7.1        |
-| torch_npu | == 2.7.1.post2  |
+| CANN      | >= 8.5.1        |
+| torch     | >= 2.7.1        |
+| torch_npu | >= 2.7.1.post4  |
+
+Install vLLM-Ascend together with CANN, torch, and torch_npu as one compatibility set. For details, see the [vLLM-Ascend 0.23.0 installation guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0/installation.html).
 
 For base environment setup, see the [Ascend PyTorch installation guide](https://gitcode.com/Ascend/pytorch). The examples in this document were verified on 8 * Ascend 910B3 64G.
 
@@ -61,11 +85,11 @@ For base environment setup, see the [Ascend PyTorch installation guide](https://
 | SFT       | Qwen3-30B-A3B               | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
 | SFT       | Qwen3-32B                   | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
 | SFT       | Qwen3-VL-30B-A3B-Instruct   | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
-| SFT       | Qwen3-Omni-30B-A3B-Instruct | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
+| SFT       | Qwen3-Omni-30B-A3B-Instruct | FSDP1/FSDP2/deepspeed/Megatron | Atlas 900 A2 PODc/A3 SuperPoD |
 | SFT       | InternVL3-8B                | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
 | SFT       | Ovis2.5-2B                  | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
-| SFT       | Qwen3.5-27B                 | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
-| SFT       | Qwen3.5-35B-A3B             | FSDP1/FSDP2/deepspeed | Atlas 900 A2 PODc |
+| SFT       | Qwen3.5-27B                 | FSDP1/FSDP2/deepspeed/Megatron | Atlas 900 A2 PODc/A3 SuperPoD |
+| SFT       | Qwen3.5-35B-A3B             | FSDP1/FSDP2/deepspeed/Megatron | Atlas 900 A2 PODc/A3 SuperPoD |
 
 ### Verified RL Combinations
 
@@ -87,6 +111,19 @@ For base environment setup, see the [Ascend PyTorch installation guide](https://
 | Using SGLang as the inference engine      |
 | Enabling ETP for LoRA training in Megatron |
 
+### PEFT Transformers 5 MoE Fused Expert LoRA Limitation
+
+When training Transformers 5 MoE models such as Qwen3.5-MoE and Qwen3-Omni-MoE with LoRA, some expert weights may be stored as fused `nn.Parameter` tensors instead of ordinary `nn.Linear` modules. Injecting LoRA into these parameters relies on PEFT's `target_parameters` path.
+
+This path is not fully stable yet with combinations such as `lora_dropout`, ZeRO-3/FSDP, and multiple adapters. Typical trigger conditions include:
+
+- using a MoE model;
+- using LoRA and trying to cover fused expert parameters;
+- triggering PEFT's Transformers 5 MoE target conversion path through the model config or the command-line `--model_type`;
+- using the default `lora_dropout != 0`, or using parameter-sharding backends such as ZeRO-3/FSDP.
+
+For regular Qwen3.5 GRPO/SFT LoRA training, avoid explicitly passing `--model_type` when it is not needed. If the model config itself already triggers this PEFT path, prefer full-parameter training or disable the affected LoRA combination. If fused expert LoRA is required, wait for the PEFT upstream support to stabilize, or use it only after validating the target model and training backend with `lora_dropout=0`.
+
 ## Choose Your Usage Path
 
 | Scenario                               | Recommended path                                      | Need MindSpeed |
@@ -100,9 +137,17 @@ For base environment setup, see the [Ascend PyTorch installation guide](https://
 
 ### Image/Container Environment Installation
 
-The official NPU image is still being prepared for release. Before the official image is released, you can build a container environment with CANN, PyTorch, torch_npu, and ms-swift dependencies from the Dockerfile provided by the project. The container approach makes dependency versions easier to freeze and helps reproduce the same environment across multiple Ascend machines.
+The official NPU image is available at [quay.io/ascend/ms-swift](https://quay.io/repository/ascend/ms-swift?tab=tags). We recommend choosing an image tag that matches your device generation, Python version, CANN version, and OS version first. If you need to pin a branch or customize dependencies, build the image from the Dockerfile provided by the project. The container approach makes dependency versions easier to freeze and helps reproduce the same environment across multiple Ascend machines.
 
-Clone the modelscope repository first, then build the image with [Dockerfile.ascend](https://github.com/modelscope/modelscope/blob/master/docker/Dockerfile.ascend) and [build_image.py](https://github.com/modelscope/modelscope/blob/master/docker/build_image.py):
+The following example uses the A2, Python 3.11, CANN 9.0.0, Ubuntu 22.04 tag. In actual use, choose the latest tag from the Quay tag page that matches your machine and software stack.
+
+```shell
+docker pull quay.io/ascend/ms-swift:v4.3.0-A2-py311-CANN9.0.0-ubuntu22.04
+export IMAGE_NAME=quay.io/ascend/ms-swift:v4.3.0-A2-py311-CANN9.0.0-ubuntu22.04
+export WORKSPACE=/path/to/workspace
+```
+
+If you need to build the image yourself, clone the modelscope repository first, then use [Dockerfile.ascend](https://github.com/modelscope/modelscope/blob/master/docker/Dockerfile.ascend) and [build_image.py](https://github.com/modelscope/modelscope/blob/master/docker/build_image.py):
 
 ```shell
 git clone https://github.com/modelscope/modelscope.git
@@ -114,11 +159,10 @@ DOCKER_REGISTRY=ms-swift python docker/build_image.py \
   --arch arm
 ```
 
-The current `build_image.py` generates Ascend image names in the format `{DOCKER_REGISTRY}:{swift_branch}-{atlas_hardware}-{python_tag}-{arch}`. The command above uses the ARM-based Atlas 900 A2 PODc as an example and usually generates `ms-swift:main-A2-py311-arm`. Save the image name and workspace path in variables as shown below. Replace the image name with the actual one from your build log.
+The current `build_image.py` generates Ascend image names in the format `{DOCKER_REGISTRY}:{swift_branch}-{atlas_hardware}-{python_tag}-{arch}`. The command above uses the ARM-based Atlas 900 A2 PODc as an example and usually generates `ms-swift:main-A2-py311-arm`. If you use a self-built image, replace `IMAGE_NAME` above with the actual image name from your build log.
 
 ```shell
 export IMAGE_NAME=ms-swift:main-A2-py311-arm
-export WORKSPACE=/path/to/workspace
 ```
 
 Before starting the container, check which NPU devices are exposed on the host:
@@ -154,7 +198,7 @@ After entering the container, run `source /usr/local/Ascend/ascend-toolkit/set_e
 
 ```shell
 # Create a new conda virtual environment (optional)
-conda create -n swift-npu python=3.11 -y
+conda create -n swift-npu python=3.12 -y
 conda activate swift-npu
 
 # Source the CANN environment before the following steps
@@ -169,8 +213,10 @@ git clone https://github.com/modelscope/ms-swift.git
 cd ms-swift
 pip install -e .
 
-# Install torch-npu
-pip install torch_npu decorator
+# Install the matching PyTorch/TorchNPU runtime
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0
+pip install torch_npu==2.10.0.post4 decorator \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 # If you want to use deepspeed (to reduce memory usage, with some speed overhead)
 pip install deepspeed
 
@@ -178,8 +224,10 @@ pip install deepspeed
 pip install evalscope[opencompass]
 
 # If you need vllm-ascend for inference, install the following packages (for more versions, see the [vLLM-Ascend official website](https://docs.vllm.ai/projects/ascend/en/latest/installation.html))
-pip install vllm==0.14.0
-pip install vllm-ascend==0.14.0rc1
+pip install vllm==0.23.0
+pip install vllm-ascend==0.23.0 \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 ```
 
 ### NPU Availability Check
@@ -200,16 +248,16 @@ print(torch.randn(10, device='npu:0'))
 If you need MindSpeed(Megatron-LM), install the required dependencies as follows.
 
 ```shell
-# 1. Clone Megatron-LM and switch to v0.15.3
+# 1. Clone Megatron-LM and switch to v0.16.0
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
-git checkout v0.15.3
+git checkout core_v0.16.0
 cd ..
 
 # 2. Clone and install MindSpeed
 git clone https://gitcode.com/Ascend/MindSpeed.git
 cd MindSpeed
-git checkout core_r0.15.3
+git checkout core_r0.16.0
 pip install -e .
 cd ..
 
@@ -219,11 +267,14 @@ cd mcore-bridge
 pip install -e .
 cd ..
 
-# 4. Set environment variables
+# 4. Download and install triton-ascend
+pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+
+# 5. Set environment variables
 export PYTHONPATH=$PYTHONPATH:<your_local_megatron_lm_path>
 export MEGATRON_LM_PATH=<your_local_megatron_lm_path>
 
-# 5. Disable Megatron GDN if you need to fall back to the transformers GatedDeltaNet implementation
+# 6. Disable Megatron GDN if you need to fall back to the transformers GatedDeltaNet implementation
 export USE_MCORE_GDN=0
 ```
 
@@ -235,61 +286,31 @@ python -c "import mindspeed.megatron_adaptor; from swift.megatron.init import in
 
 ### Qwen3.5 FLA Patch Notes
 
-The current repository already includes a built-in Qwen3.5 linear attention patch for Ascend NPUs, so users do not need to manually modify the `transformers` or `fla` source code. This patch does not replace the entire `flash-linear-attention` package directly. Instead, it redirects the low-level GPU Triton operator path used by `Qwen3.5` through `chunk_gated_delta_rule` to the MindSpeed NPU implementation.
+Qwen3.5 on Ascend NPU now uses the native Triton-Ascend GDN backend from `flash-linear-attention` (FLA). ms-swift no longer embeds or maintains a copy of MindSpeed's `chunk_gated_delta_rule`.
 
-When the patch takes effect, ms-swift performs the following replacements:
+ms-swift retains only two NPU compatibility adjustments:
 
-1. Set `transformers.utils.is_flash_linear_attention_available` and `transformers.utils.import_utils.is_flash_linear_attention_available` to return `True`, so that `transformers.models.qwen3_5.modeling_qwen3_5` can complete initialization through the FLA fast path.
-2. Redirect `transformers.models.qwen3_5.modeling_qwen3_5.chunk_gated_delta_rule` and `transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.chunk_gated_delta_rule` to the built-in ms-swift implementation `swift.model.chunk_gated_delta_rule.chunk_gated_delta_rule`.
-3. Inside `swift.model.chunk_gated_delta_rule`, continue calling the native Triton operators provided by MindSpeed, including:
-   - `mindspeed.lite.ops.triton.chunk_delta_h`
-   - `mindspeed.lite.ops.triton.chunk_o`
-   - `mindspeed.lite.ops.triton.chunk_scaled_dot_kkt`
-   - `mindspeed.lite.ops.triton.wy_fast`
-4. Keep the native torch l2norm helper, reducing per-layer per-step launch overhead as well as compile/autotune overhead during cold start, which improves model performance on NPU.
-5. For `FusedRMSNormGated`, which depends on `torch.cuda.current_device()` during FLA initialization, NPU keeps the native Qwen3.5 torch path to avoid compatibility issues caused by CUDA-only initialization logic.
+1. Transformers' FLA availability check includes a CUDA condition. On NPU, ms-swift supplements it by checking FLA's public causal-conv and GDN entry points. FLA remains responsible for selecting and validating the concrete NPU backend.
+2. Transformers currently initializes `FusedRMSNormGated` with `torch.cuda.current_device()`, so NPU keeps Qwen3.5's native torch norm. This does not affect the FLA GDN path.
 
 The call chain can be understood as:
 
 ```text
 Qwen3.5 modeling.chunk_gated_delta_rule
-    -> swift.model.chunk_gated_delta_rule.chunk_gated_delta_rule
-    -> MindSpeed Triton kernels
+    -> fla.ops.gated_delta_rule.chunk_gated_delta_rule
+    -> fla.ops.gated_delta_rule.backends.triton_ascend
 ```
 
-Therefore:
+- Install the latest FLA main branch to obtain NPU GDN support.
+- Current verification environment: torch 2.9.0+cpu, torch-npu 2.9.0.post2, FLA 0.5.2 main, triton-ascend 3.2.1, and transformers 5.12.1.
 
-- This patch mainly covers the **gated-delta-rule path of Qwen3.5 linear attention**.
-- It is not equivalent to “fully replacing the entire fla package with MindSpeed”.
-- To make this path effective, ensure that MindSpeed can be imported correctly in the current environment.
-- Verified versions for accuracy alignment: torch 2.7.1 + MindSpeed 0.12.1 + flash-linear-attention 4.1.0 + triton-ascend 3.2.0 + transformers 5.2.0
+When running Qwen3.5 on NPU with either the transformers backend or the Megatron-SWIFT backend, note the following version and feature constraints:
 
-When running Qwen3.5 with Megatron-SWIFT on NPU, note the following version and feature constraints:
+1. The MindSpeed training combination currently pinned by the NPU documentation is `Megatron-LM v0.16.0 + MindSpeed core_r0.16.0`. `mcore-bridge` defaults to the Megatron-Core/MindSpeed GDN path with `USE_MCORE_GDN=1`. With `USE_MCORE_GDN=0`, it uses the transformers GDN. That path first attempts to use the FLA Triton-Ascend backend described above; when FLA is unavailable, it only logs a warning and preserves the currently selected MindSpeed/Megatron GDN implementation rather than proactively replacing it with Torch, so FLA is not a hard dependency for ordinary Megatron training.
 
-1. The MindSpeed training combination currently pinned by the NPU documentation
-   is `Megatron-LM v0.15.3 + MindSpeed core_r0.15.3`. This version of
-   `megatron-core` does not yet ship the native GDN kernel
-   `core.ssm.gated_delta_net` introduced in `0.16`. As a result, you must
-   override the default and explicitly set `USE_MCORE_GDN=0`, which switches
-   GDN back to the transformers-native implementation wrapped by
-   `mcore-bridge`. Combined with ms-swift's built-in Qwen3.5 FLA NPU patch,
-   `chunk_gated_delta_rule` is then redirected to MindSpeed's Triton kernels.
-   The known costs of this fallback path are:
+2. MindSpeed initialization and training-argument `repatch()` may replace FLA's public GDN entry point. Before building `mcore-bridge` and again after `repatch()`, ms-swift first tries to restore FLA's original callable from the `orig_func` saved by the MindSpeed patch manager. The `mcore-bridge` cached callable is refreshed only after FLA is restored successfully. If FLA is missing or restoration fails, the current GDN callable is not modified and a warning is recorded. Packed/varlen support depends on the retained implementation; if it does not support non-empty `cu_seqlens`, the actual GDN call fails and a working FLA installation is required.
 
-   - The transformers GDN implementation does not support packing, nor TP/CP
-     for the GDN layer.
-   - Under the NPU + flash-attn combination, the transformers GDN
-     implementation also has a known mask-routing issue: when
-     `padding_free=False`, GDN ends up reading the `attention_mask` that has
-     already been transformed by the trainer instead of the `attention_mask_2d`
-     it actually needs, which triggers an asynchronous
-     `aclnnFlashAttentionScore` failure. This has been fixed on the
-     `qwen3_5_npu` branch of `mcore-bridge`; NPU users must therefore install
-     a version that includes the fix.
-
-2. Once MindSpeed ships a `core_r0.16.x` adaptation branch, both constraints
-   — the required `USE_MCORE_GDN=0` override and the feature limitations of
-   the transformers GDN implementation — can be lifted together.
+3. Qwen3.5-4B has completed a Transformers/FSDP LoRA validation on 8 Atlas 900 A2 cards: BF16, `alpaca-gpt4-data-zh`, `packing=true`, `max_length=512`, per-device batch size 1, gradient accumulation 1, and 300 training steps. Loss and grad norm remained finite throughout, and a checkpoint was saved successfully. Under the same configuration, the NPU loss trend aligned with the GPU reference.
 
 ### Environment Viewing
 Check the P2P connections of the NPU, where we can see that each NPU is interconnected through 7 HCCS links with other NPUs.
@@ -684,9 +705,11 @@ ASCEND_RT_VISIBLE_DEVICES=0 swift deploy --model xxx/checkpoint-xxx-merged --max
 Install from PyPI:
 
 ```shell
-# Refer to the official vLLM-Ascend compatibility matrix; the following versions are verified in this document.
-pip install vllm==0.14.0
-pip install vllm-ascend==0.14.0rc1
+# Refer to the official vLLM-Ascend compatibility matrix; the following versions are recommended here.
+pip install vllm==0.23.0
+pip install vllm-ascend==0.23.0 \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 ```
 
 Original model:
@@ -723,7 +746,7 @@ After training, inference, or deployment, you can evaluate the original model or
 
 ## Release
 
-If you need to publish NPU-trained checkpoints, merged models, or quantized models to ModelScope/HuggingFace, use the push capability in `swift export`. For complete arguments and examples, see [Export and Push](../Instruction/Export-and-push.md#push-models).
+If you need to publish NPU-trained checkpoints, merged models, or quantized models to ModelScope/HuggingFace, use the push capability in `swift export`. For complete arguments and examples, see [Export and Push](../Instruction/Export-and-push.md#push-model).
 
 ## FAQ
 

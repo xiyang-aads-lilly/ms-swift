@@ -2,6 +2,7 @@
 import inspect
 import torch
 import torch.nn as nn
+from accelerate.utils import is_peft_model
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -132,6 +133,17 @@ class RLHFTrainerMixin:
         kwargs = {'train_dataset': train_dataset} if 'train_dataset' in parameters else {}
         return get_train_sampler(**kwargs)
 
+    @staticmethod
+    def _packed_sequence_sum(values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """Sum contiguous packed token values without reading sequence lengths on the host."""
+        segment_ids = torch.repeat_interleave(
+            torch.arange(lengths.shape[0], device=lengths.device), lengths, output_size=values.shape[0])
+        # Match torch.sum's effective accumulation precision for low-precision inputs.
+        accumulation_values = values.float() if values.dtype in (torch.float16, torch.bfloat16) else values
+        result = accumulation_values.new_zeros((lengths.shape[0], *values.shape[1:]))
+        result.index_add_(0, segment_ids, accumulation_values)
+        return result.to(values.dtype)
+
     def get_per_token_logps(
         self,
         logits: torch.FloatTensor,
@@ -162,7 +174,7 @@ class RLHFTrainerMixin:
             labels = labels.to(logits.device)
             loss_mask = loss_mask.to(logits.device)
             mean_logits = reduce_logits
-            per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+            per_token_logps = selective_log_softmax(logits, labels)
             position_ids = sequence_parallel.real_position_ids
             total_per_token_logps, total_loss_mask = GatherLoss.apply(per_token_logps, loss_mask, 1, position_ids)
             total_mean_logits = sequence_parallel.gather(mean_logits, dim=1, position_ids=position_ids)
@@ -180,3 +192,14 @@ class RLHFTrainerMixin:
                 total_mean_logits = total_mean_logits.unsqueeze(0)
                 total_loss_mask = total_loss_mask.unsqueeze(0)
             return total_per_token_logps, total_mean_logits, total_loss_mask
+
+    @contextmanager
+    def null_ref_context(self):
+        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
+        with self.accelerator.unwrap_model(self.model).disable_adapter() if is_peft_model(
+                self.model) and not self.ref_adapter_name else nullcontext():
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.ref_adapter_name)
+            yield
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.model_adapter_name or 'default')
